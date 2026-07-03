@@ -1,508 +1,398 @@
-import streamlit as st
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-import requests
-from bs4 import BeautifulSoup
 import warnings
-import re
-import io
-import json
 import os
+import json
+import time
+import requests
+import unicodedata
 
 warnings.filterwarnings('ignore')
 
-# --- ページ設定 ---
-st.set_page_config(page_title="大黒天AI V6 五大老実戦モード", page_icon="🔱", layout="wide")
+# ターミナル用カラーコード
+GREEN = '\033[92m'
+YELLOW = '\033[93m'
+RED = '\033[91m'
+CYAN = '\033[96m'
+RESET = '\033[0m'
 
-st.title("🔱 大黒天AI V6 五大老・合議制システム 🔱")
-st.subheader("〜 リアルオッズ直接解析 × 傾斜加重合議アンサンブル予測 〜")
-st.markdown("---")
+print(f"{CYAN}===================================================={RESET}")
+print(f"{CYAN} 🔱 大黒天AI V6 ガチバックテスト（おすすめ馬券抽出機能付き） 🔱{RESET}")
+print(f"{CYAN}===================================================={RESET}")
 
-# 🔄 セッションステート（状態保存）
-if 'scraped_data' not in st.session_state:
-    st.session_state.scraped_data = None
-if 'extracted_info' not in st.session_state:
-    st.session_state.extracted_info = ""
+if not os.path.exists("ultimate_master_data_v4.csv"):
+    print(f"{RED}❌ エラー: 'ultimate_master_data_v4.csv' が見つかりません。{RESET}")
+    exit()
 
-# 🚨 【永久エラー回避ハック】html5lib / lxml等の追加ライブラリに一切依存しない自作テーブルパース関数
-def parse_html_table_safe(html_content):
-    soup = BeautifulSoup(html_content, 'html.parser')
-    tables = soup.find_all('table')
-    if not tables:
-        raise ValueError("HTML内にテーブルが見つかりません。")
-    
-    # 最も行数の多いテーブルを選択（出馬表やオッズテーブルを自動選択）
-    best_table = None
-    max_rows = 0
-    for t in tables:
-        rows = t.find_all('tr')
-        if len(rows) > max_rows:
-            max_rows = len(rows)
-            best_table = t
-            
-    if not best_table:
-        raise ValueError("有効な行データを持つテーブルが見つかりません。")
-        
-    all_trs = best_table.find_all('tr')
-    
-    table_data = []
-    for tr in all_trs:
-        cells = tr.find_all(['th', 'td'])
-        cell_values = []
-        for cell in cells:
-            # 余分な改行や空白を除去
-            val = " ".join(cell.get_text().split())
-            cell_values.append(val)
-        if cell_values:
-            table_data.append(cell_values)
-            
-    if not table_data:
-        raise ValueError("テーブルデータが空です。")
-        
-    # 最多列数を計算
-    max_cols = max(len(row) for row in table_data)
-    
-    # 最初の行をヘッダーとする
-    header = table_data[0]
-    if len(header) < max_cols:
-        header = header + [f"Col_{i}" for i in range(len(header), max_cols)]
-    else:
-        header = header[:max_cols]
-        
-    # 重複する列名に一意の番号を付与してPandasのエラーを回避
-    seen = {}
-    new_header = []
-    for h in header:
-        if not h:
-            h = "EmptyCol"
-        if h in seen:
-            seen[h] += 1
-            new_header.append(f"{h}_{seen[h]}")
-        else:
-            seen[h] = 0
-            new_header.append(h)
-            
-    # データ行の作成
-    data_rows = table_data[1:]
-    cleaned_rows = []
-    for r in data_rows:
-        if len(r) < max_cols:
-            r = r + [""] * (max_cols - len(r))
-        else:
-            r = r[:max_cols]
-        cleaned_rows.append(r)
-        
-    return pd.DataFrame(cleaned_rows, columns=new_header)
+print(f"⏳ 1. マスターデータの読み込みと時系列の厳密ソートを実行中...")
+
+df_master = pd.read_csv("ultimate_master_data_v4.csv", low_memory=False)
+df_bt = df_master.copy()
+
+# 📅 日付処理と【カンニング防止用】厳密な時系列ソート
+df_bt['race_date'] = pd.to_datetime(df_bt['race_id'].astype(str).str[:8], format='%Y%m%d', errors='coerce')
+df_bt = df_bt.dropna(subset=['race_date']).sort_values(['race_date', 'race_id', '馬番'])
+
+# 特徴量エンジニアリング
+df_bt['コース_num'] = df_bt['コース'].map({"芝": 0, "ダート": 1, "障害": 2}).fillna(0)
+df_bt['天候_num'] = df_bt['天候'].map({"晴": 0, "曇": 1, "小雨": 2, "雨": 3, "雪": 4}).fillna(0)
+df_bt['馬場状態_num'] = df_bt['馬場状態'].map({"良": 0, "稍重": 1, "重": 2, "不良": 3, "不明": -1}).fillna(-1)
+df_bt['斤量_num'] = pd.to_numeric(df_bt['斤量'], errors='coerce').fillna(55.0)
+df_bt['体重'] = pd.to_numeric(df_bt['体重'], errors='coerce').fillna(480.0)
+df_bt['年齢'] = pd.to_numeric(df_bt['年齢'], errors='coerce').fillna(3.0)
+df_bt['出走間隔_days'] = pd.to_numeric(df_bt['出走間隔_days'], errors='coerce').fillna(60.0)
+df_bt['単勝オッズ'] = pd.to_numeric(df_bt['単勝'], errors='coerce').fillna(10.0)
+
+# 🚨 【超重要バグ修正】全角数字や「1(降)」などの文字混じりを完璧に数字だけ抜き出す
+df_bt['着順'] = df_bt['着順'].astype(str).str.extract(r'(\d+)')[0].astype(float).fillna(99.0)
+
+bt_jockey_map = {j: i for i, j in enumerate(df_bt['騎手'].value_counts().index)}
+bt_trainer_map = {t: i for i, t in enumerate(df_bt['調教師'].value_counts().index)}
+df_bt['騎手_num'] = df_bt['騎手'].map(bt_jockey_map).fillna(-1)
+df_bt['調教師_num'] = df_bt['調教師'].map(bt_trainer_map).fillna(-1)
+df_bt['脚質_num'] = df_bt['脚質'].map({"逃げ": 0, "先行": 1, "差し": 2, "追込": 3, "その他": 4, "不明": 4}).fillna(4)
+df_bt['上がり3F'] = pd.to_numeric(df_bt['上がり3F'], errors='coerce').fillna(35.0)
+
+# 🛡️ カンニング防止：馬ごとに過去情報だけで特徴量を作る
+df_bt = df_bt.sort_values(['馬名', 'race_date'])
+df_bt['前走着順'] = df_bt.groupby('馬名')['着順'].shift(1).fillna(8.0)
+df_bt['出走回数'] = df_bt.groupby('馬名').cumcount() + 1
+df_bt['全体過去平均着順'] = df_bt.groupby('馬名')['着順'].transform(lambda x: x.expanding().mean().shift(1)).fillna(8.0)
+df_bt['前走脚質_num'] = df_bt.groupby('馬名')['脚質_num'].shift(1).fillna(4.0)
+df_bt['前走上がり3F'] = df_bt.groupby('馬名')['上がり3F'].shift(1).fillna(35.0)
+df_bt['過去平均上がり3F'] = df_bt.groupby('馬名')['上がり3F'].transform(lambda x: x.expanding().mean().shift(1)).fillna(35.0)
+df_bt['target_win'] = (df_bt['着順'] == 1.0).astype(int)
+
+features = [
+    '枠番', '単勝オッズ', '斤量_num', 'コース_num', '距離', '天候_num', 
+    '体重', '年齢', '馬場状態_num', '騎手_num', '調教師_num', '出走間隔_days',
+    '全体過去平均着順', '前走着順', '出走回数', '前走脚質_num', '前走上がり3F', '過去平均上がり3F'
+]
+
+# 📅 データの期間分割（2026年3月までを学習、4月〜6月をテスト）
+train_mask = df_bt['race_date'] < '2026-04-01'
+test_mask = (df_bt['race_date'] >= '2026-04-01') & (df_bt['race_date'] <= '2026-06-30')
+
+df_train = df_bt[train_mask]
+df_test = df_bt[test_mask].copy()
+
+print(f"✅ 学習データ: {len(df_train)}件 (〜2026年3月)")
+print(f"✅ テストデータ: {len(df_test)}件 (2026年4月〜6月)")
+
+if len(df_test) == 0:
+    print(f"{RED}❌ エラー: 指定期間（2026年4月〜6月）のデータが存在しません。{RESET}")
+    exit()
+
+print(f"\n🧠 2. 五大老AIの学習を開始します（約5秒）...")
+
+train_set = lgb.Dataset(df_train[features], label=df_train['target_win'])
+
+bt_models = {
+    '家康': lgb.train({'objective':'binary','metric':'binary_logloss','verbosity':-1,'random_state':42,'learning_rate':0.03,'num_leaves':15}, train_set, num_boost_round=100),
+    '利家': lgb.train({'objective':'binary','metric':'binary_logloss','verbosity':-1,'random_state':104,'learning_rate':0.05,'num_leaves':31}, train_set, num_boost_round=90),
+    '景勝': lgb.train({'objective':'binary','metric':'binary_logloss','verbosity':-1,'random_state':555,'learning_rate':0.05,'num_leaves':31,'lambda_l1':1.5}, train_set, num_boost_round=90),
+    '輝元': lgb.train({'objective':'binary','metric':'binary_logloss','verbosity':-1,'random_state':888,'learning_rate':0.04,'num_leaves':31}, train_set, num_boost_round=80),
+    '秀家': lgb.train({'objective':'binary','metric':'binary_logloss','verbosity':-1,'random_state':777,'learning_rate':0.08,'num_leaves':15}, train_set, num_boost_round=70)
+}
+
+# 🛡️ 予測の前に、正解データ（着順）を完全に隠蔽する
+X_test = df_test[features].fillna(0).copy()
+
+print(f"\n🔮 3. 五大老による勝率予測を実行中...")
+df_test['pred_win_raw'] = (
+    bt_models['家康'].predict(X_test) * 0.35 + 
+    bt_models['利家'].predict(X_test) * 0.25 + 
+    bt_models['景勝'].predict(X_test) * 0.20 + 
+    bt_models['輝元'].predict(X_test) * 0.12 + 
+    bt_models['秀家'].predict(X_test) * 0.08
+)
+df_test['pred_win'] = df_test.groupby('race_id')['pred_win_raw'].transform(lambda x: x / (x.sum() if x.sum() > 0 else 1))
 
 
-# 🧠 【ステップ1】五大老AI（5つの独立モデル）のロード・学習
-@st.cache_resource
-def load_ai_and_memory():
-    # 🌟 爆速起動ハック：GitHubに学習済み軽量ファイル群があるかを自動検知
-    required_files = [
-        "model_ieyasu.txt", "model_toshiie.txt", "model_kagekatsu.txt", 
-        "model_terumoto.txt", "model_hideie.txt", "jockey_map.json", 
-        "trainer_map.json", "lite_memory_df.csv"
-    ]
-    
-    is_lite_mode = all(os.path.exists(f) for f in required_files)
-    features = [
-        '枠番', '単勝オッズ', '斤量_num', 'コース_num', '距離', '天候_num', 
-        '体重', '年齢', '馬場状態_num', '騎手_num', '調教師_num', '出走間隔_days',
-        '全体過去平均着順', '前走着順', '出走回数', '前走脚質_num', '前走上がり3F', '過去平均上がり3F'
-    ]
+print(f"\n🌐 4. 実際の複勝・馬連・ワイドオッズの抜き取り作業を開始します...")
+unique_test_races = df_test['race_id'].unique()
+odds_cache_file = "real_odds_cache_2026.json"
 
-    if is_lite_mode:
-        # ⚡️ 【爆速モード】1秒で頭脳ファイルをダイレクトロード
-        models = {
-            '徳川家康 (堅実)': lgb.Booster(model_file="model_ieyasu.txt"),
-            '前田利家 (王道)': lgb.Booster(model_file="model_toshiie.txt"),
-            '上杉景勝 (頑健)': lgb.Booster(model_file="model_kagekatsu.txt"),
-            '毛利輝元 (大局)': lgb.Booster(model_file="model_terumoto.txt"),
-            '宇喜多秀家 (一発)': lgb.Booster(model_file="model_hideie.txt")
-        }
-        with open("jockey_map.json", "r", encoding="utf-8") as f:
-            jockey_map = json.load(f)
-        with open("trainer_map.json", "r", encoding="utf-8") as f:
-            trainer_map = json.load(f)
-        memory_df = pd.read_csv("lite_memory_df.csv", low_memory=False).set_index('馬名')
-        
-        st.session_state.is_lite_active = True
-        return models, features, jockey_map, trainer_map, memory_df
-
-    else:
-        # 🐢 【通常モード】CSVから数分かけて再学習
-        df_master = pd.read_csv("ultimate_master_data_v4.csv", low_memory=False)
-        
-        df_train = df_master.copy()
-        df_train['コース_num'] = df_train['コース'].map({"芝": 0, "ダート": 1, "障害": 2}).fillna(0)
-        df_train['天候_num'] = df_train['天候'].map({"晴": 0, "曇": 1, "小雨": 2, "雨": 3, "雪": 4}).fillna(0)
-        df_train['馬場状態_num'] = df_train['馬場状態'].map({"良": 0, "稍重": 1, "重": 2, "不良": 3, "不明": -1}).fillna(-1)
-        df_train['斤量_num'] = pd.to_numeric(df_train['斤量'], errors='coerce').fillna(55.0)
-        df_train['体重'] = pd.to_numeric(df_train['体重'], errors='coerce').fillna(480.0)
-        df_train['年齢'] = pd.to_numeric(df_train['年齢'], errors='coerce').fillna(3.0)
-        df_train['出走間隔_days'] = pd.to_numeric(df_train['出走間隔_days'], errors='coerce').fillna(60.0)
-        df_train['単勝オッズ'] = pd.to_numeric(df_train['単勝'], errors='coerce').fillna(0.0)
-        
-        jockey_map = {j: i for i, j in enumerate(df_train['騎手'].value_counts().index)}
-        trainer_map = {t: i for i, t in enumerate(df_train['調教師'].value_counts().index)}
-        df_train['騎手_num'] = df_train['騎手'].map(jockey_map).fillna(-1)
-        df_train['調教師_num'] = df_train['調教師'].map(trainer_map).fillna(-1)
-        df_train['脚質_num'] = df_train['脚質'].map({"逃げ": 0, "先行": 1, "差し": 2, "追込": 3, "その他": 4, "不明": 4}).fillna(4)
-        df_train['上がり3F'] = pd.to_numeric(df_train['上がり3F'], errors='coerce').fillna(35.0)
-
-        df_train['race_date'] = pd.to_datetime(df_train['race_id'].astype(str).str[:8], format='%Y%m%d', errors='coerce')
-        df_train = df_train.sort_values(['馬名', 'race_date'])
-        df_train['前走着順'] = df_train.groupby('馬名')['着順'].shift(1).fillna(8.0)
-        df_train['出走回数'] = df_train.groupby('馬名').cumcount() + 1
-        df_train['全体過去平均着順'] = df_train.groupby('馬名')['着順'].transform(lambda x: x.expanding().mean().shift(1)).fillna(8.0)
-        df_train['前走脚質_num'] = df_train.groupby('馬名')['脚質_num'].shift(1).fillna(4.0)
-        df_train['前走上がり3F'] = df_train.groupby('馬名')['上がり3F'].shift(1).fillna(35.0)
-        df_train['過去平均上がり3F'] = df_train.groupby('馬名')['上がり3F'].transform(lambda x: x.expanding().mean().shift(1)).fillna(35.0)
-
-        df_train['target_win'] = (df_train['着順'] == 1).astype(int)
-
-        train_set = lgb.Dataset(df_train[features], label=df_train['target_win'])
-
-        # 🔱 五大老AIモデル群の並列構築（一番利益率が高かった戦略的パラメータ群）
-        # 1. 徳川家康モデル: 安定・堅実重視（浅い木、学習率低め）
-        params_ieyasu = {
-            'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
-            'random_state': 42, 'learning_rate': 0.03, 'num_leaves': 15, 'max_depth': 4
-        }
-        model_ieyasu = lgb.train(params_ieyasu, train_set, num_boost_round=120)
-
-        # 2. 前田利家モデル: 王道・バランス重視
-        params_toshiie = {
-            'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
-            'random_state': 104, 'learning_rate': 0.05, 'num_leaves': 31, 'max_depth': 6
-        }
-        model_toshiie = lgb.train(params_toshiie, train_set, num_boost_round=100)
-
-        # 3. 上杉景勝モデル: 頑健・過学習防止（L1/L2正則化強化）
-        params_kagekatsu = {
-            'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
-            'random_state': 555, 'learning_rate': 0.05, 'num_leaves': 31, 'max_depth': 5,
-            'lambda_l1': 1.5, 'lambda_l2': 1.5
-        }
-        model_kagekatsu = lgb.train(params_kagekatsu, train_set, num_boost_round=100)
-
-        # 4. 毛利輝元モデル: 大局観重視（深めの木で血統等の複雑な相関を捉える）
-        params_terumoto = {
-            'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
-            'random_state': 888, 'learning_rate': 0.04, 'num_leaves': 63, 'max_depth': 8
-        }
-        model_terumoto = lgb.train(params_terumoto, train_set, num_boost_round=90)
-
-        # 5. 宇喜多秀家モデル: 一発の妙味（高めの学習率、直近勢いや軽斤量の見抜き）
-        params_hideie = {
-            'objective': 'binary', 'metric': 'binary_logloss', 'verbosity': -1,
-            'random_state': 777, 'learning_rate': 0.08, 'num_leaves': 15, 'max_depth': 5
-        }
-        model_hideie = lgb.train(params_hideie, train_set, num_boost_round=80)
-
-        models = {
-            '徳川家康 (堅実)': model_ieyasu,
-            '前田利家 (王道)': model_toshiie,
-            '上杉景勝 (頑健)': model_kagekatsu,
-            '毛利輝元 (大局)': model_terumoto,
-            '宇喜多秀家 (一発)': model_hideie
-        }
-
-        memory_df = df_train.groupby('馬名').tail(1).set_index('馬名')
-        st.session_state.is_lite_active = False
-        return models, features, jockey_map, trainer_map, memory_df
-
-if 'is_lite_active' not in st.session_state:
-    st.session_state.is_lite_active = False
-
-with st.spinner("🏇 五大老AI（5種の予測エンジン）が合議の準備中..."):
-    models, features, jockey_map, trainer_map, memory_df = load_ai_and_memory()
-
-if st.session_state.is_lite_active:
-    st.success("⚡️ 【爆速モード】学習済み頭脳データをロードしました！起動時間 1.0秒")
+if os.path.exists(odds_cache_file):
+    with open(odds_cache_file, 'r', encoding='utf-8') as f:
+        real_odds_cache = json.load(f)
 else:
-    st.success("✨ 五大老AI、すべて実戦起動しました！合議の体制は完璧です。")
-    st.info("💡 現在は過去データ（CSV）から毎回再学習しています。スマホでの起動を「1秒」に爆速化したい場合は、右側ガイドに沿って軽量化ファイルをGitHubへアップロードしてください。")
+    real_odds_cache = {}
 
-# =========================================================
-# 🧭 【ステップ2】URL入力 ＆ 裏APIからのデータ強奪
-# =========================================================
-st.sidebar.header("🎯 リアルタイム実戦パネル")
+def fetch_real_odds_from_api(race_id_str):
+    base_url = "https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={}&action=init&type={}"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    odds_dict = {'win': {}, 'place': {}, 'quinella': {}, 'wide': {}}
+    try:
+        res1 = requests.get(base_url.format(race_id_str, 1), headers=headers, timeout=5)
+        d1 = res1.json().get('data', {}).get('odds', {})
+        if '1' in d1:
+            for k, v in d1['1'].items(): odds_dict['win'][str(k)] = float(v[0])
+        if '2' in d1:
+            for k, v in d1['2'].items(): odds_dict['place'][str(k)] = float(v[0])
+        res4 = requests.get(base_url.format(race_id_str, 4), headers=headers, timeout=5)
+        d4 = res4.json().get('data', {}).get('odds', {})
+        for k1, v1_dict in d4.items():
+            for k2, v2 in v1_dict.items():
+                u1, u2 = sorted([int(k1), int(k2)])
+                odds_dict['quinella'][f"{u1}-{u2}"] = float(v2[0])
+        res5 = requests.get(base_url.format(race_id_str, 5), headers=headers, timeout=5)
+        d5 = res5.json().get('data', {}).get('odds', {})
+        for k1, v1_dict in d5.items():
+            for k2, v2 in v1_dict.items():
+                u1, u2 = sorted([int(k1), int(k2)])
+                odds_dict['wide'][f"{u1}-{u2}"] = float(v2[0])
+    except Exception:
+        pass
+    return odds_dict
 
-target_url = st.sidebar.text_input("🔗 netkeiba出馬表URL", placeholder="https://race.netkeiba.com/...")
+new_scrapes = 0
+for i, r_id in enumerate(unique_test_races):
+    r_id_str = str(r_id)
+    if r_id_str not in real_odds_cache:
+        real_odds_cache[r_id_str] = fetch_real_odds_from_api(r_id_str)
+        new_scrapes += 1
+        time.sleep(0.2)
+        if new_scrapes % 20 == 0:
+            print(f"   ... APIからオッズ抽出中 ({i+1}/{len(unique_test_races)} レース完了)")
 
-st.sidebar.markdown("**📝 レース環境設定（手動選択式で確実化）**")
-weather_sel = st.sidebar.selectbox("天候", ["晴", "曇", "小雨", "雨", "雪"])
-cond_sel = st.sidebar.selectbox("馬場状態", ["良", "稍重", "重", "不良"])
+if new_scrapes > 0:
+    with open(odds_cache_file, 'w', encoding='utf-8') as f:
+        json.dump(real_odds_cache, f, ensure_ascii=False)
+    print(f"   ✅ 新たに {new_scrapes} レースの【本物オッズ】をスクレイピングして保存しました。")
 
-st.sidebar.markdown("---")
+def calculate_exact_multi_probabilities(win_probs):
+    n = len(win_probs)
+    eps = 1e-9
+    win_probs = np.array(win_probs) + eps
+    win_probs /= win_probs.sum()
+    place = np.zeros(n)
+    quinella = np.zeros((n, n))
+    wide = np.zeros((n, n))
+    for i in range(n):
+        p1 = win_probs[i]
+        for j in range(n):
+            if i == j: continue
+            p2 = win_probs[j] / (1.0 - p1)
+            quinella[i, j] += p1 * p2
+            for k in range(n):
+                if k == i or k == j: continue
+                denom = 1.0 - p1 - win_probs[j]
+                p3 = win_probs[k] / denom if denom > 0 else 0
+                p123 = p1 * p2 * p3
+                place[i] += p123
+                place[j] += p123
+                place[k] += p123
+                wide[i, j] += p123
+                wide[j, k] += p123
+                wide[i, k] += p123
+    return place, quinella, wide / 2.0
 
-if st.sidebar.button("🚀 ワンクリックで五大老合議予想を実行", type="primary"):
-    if not target_url:
-        st.error("URLを入力してください！")
-    else:
-        with st.spinner("🌐 netkeibaから出馬表とオッズを全自動解析中..."):
-            try:
-                headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
-                res = requests.get(target_url, headers=headers)
-                
-                # HTMLを完璧にデコードして文字化けを防止
-                html_text = res.content.decode('euc-jp', errors='ignore')
-                
-                # BeautifulSoupで一度パースし、二重翻訳防止ハックを適用
-                soup = BeautifulSoup(html_text, 'html.parser')
-                for meta in soup.find_all('meta'):
-                    if meta.get('charset') or 'content-type' in str(meta.get('http-equiv', '')).lower():
-                        meta.decompose()
-                html_text_clean = str(soup)
-                
-                race_data_div = soup.find(class_=re.compile(r'RaceData'))
-                search_text = race_data_div.get_text() if race_data_div else soup.get_text()[:3000]
-                
-                # コースと距離のみURLから自動抽出
-                course_num, course_str = 0, "芝"
-                if "ダート" in search_text: course_num, course_str = 1, "ダート"
-                elif "障害" in search_text: course_num, course_str = 2, "障害"
-                
-                dist_match = re.search(r'(\d{4})m', search_text)
-                dist_val = int(dist_match.group(1)) if dist_match else 2000
-                
-                # 天気と馬場状態はサイドバーの選択値を適用
-                weather_num = {"晴": 0, "曇": 1, "小雨": 2, "雨": 3, "雪": 4}[weather_sel]
-                cond_num = {"良": 0, "稍重": 1, "重": 2, "不良": 3}[cond_sel]
+all_bets = []
 
-                st.session_state.extracted_info = f"【{course_str} {dist_val}m / 天候: {weather_sel} / 馬場: {cond_sel}】"
-                
-                # 🚨 【完全解決】html5libに依存しない自作テーブルパース関数で出馬表を解読！
-                df_live = parse_html_table_safe(html_text_clean)
-                
-                df_predict = pd.DataFrame()
-                df_str = df_live.astype(str)
-                
-                c_horse = None
-                for c in df_live.columns:
-                    if df_str[c].str.contains(r'[ァ-ン]', regex=True).any():
-                        c_horse = c; break
-                df_predict['馬名'] = df_str[c_horse].str.strip() if c_horse else "不明"
-                
-                c_umaban = next((c for c in df_live.columns if '馬番' in str(c)), None)
-                df_predict['馬番'] = pd.to_numeric(df_live[c_umaban], errors='coerce') if c_umaban else range(1, len(df_predict)+1)
-                
-                c_waku = next((c for c in df_live.columns if '枠' in str(c)), None)
-                df_predict['枠番'] = pd.to_numeric(df_live[c_waku], errors='coerce').fillna(4) if c_waku else 4
-                
-                c_kinryo = next((c for c in df_live.columns if '斤量' in str(c)), None)
-                df_predict['斤量_num'] = pd.to_numeric(df_live[c_kinryo], errors='coerce').fillna(55.0) if c_kinryo else 55.0
-                
-                c_jockey = next((c for c in df_live.columns if '騎手' in str(c)), None)
-                df_predict['騎手_num'] = df_str[c_jockey].map(jockey_map).fillna(-1) if c_jockey else -1
-                
-                c_age = next((c for c in df_live.columns if '性齢' in str(c) or '齢' in str(c)), None)
-                df_predict['年齢'] = df_str[c_age].str.extract(r'(\d+)').astype(float).fillna(3.0) if c_age else 3.0
-                
-                c_bw = next((c for c in df_live.columns if '体重' in str(c)), None)
-                df_predict['体重'] = df_str[c_bw].str.extract(r'(\d+)').astype(float).fillna(480.0) if c_bw else 480.0
-                
-                df_predict['コース_num'] = course_num
-                df_predict['距離'] = dist_val
-                df_predict['天候_num'] = weather_num
-                df_predict['馬場状態_num'] = cond_num
-                df_predict['調教師_num'] = -1
-                df_predict['出走間隔_days'] = 60.0
-                
-                # リアルタイムオッズ取得のために空の列を作成
-                df_predict['単勝オッズ'] = np.nan
-                df_predict['複勝オッズ'] = np.nan
+# 🚨 足切りフィルター
+MIN_WIN_PROB = 0.03   
+MIN_PLACE_PROB = 0.10 
+MIN_PAIR_PROB = 0.05  
 
-                # 🚨 【オッズ直接スクレイピング！】
-                race_id_match = re.search(r'race_id=(\d+)', target_url)
-                if race_id_match:
-                    race_id = race_id_match.group(1)
-                    odds_url = f"https://race.netkeiba.com/odds/index.html?type=b1&race_id={race_id}"
-                    try:
-                        odds_res = requests.get(odds_url, headers=headers)
-                        odds_html = odds_res.content.decode('euc-jp', errors='ignore')
-                        
-                        # 完全に文字化けとエンジンエラーを阻止
-                        odds_html_clean = re.sub(r'<meta.*?charset.*?>', '', odds_html, flags=re.IGNORECASE)
-                        odds_soup = BeautifulSoup(odds_html_clean, 'html.parser')
-                        for meta in odds_soup.find_all('meta'):
-                            if meta.get('charset') or 'content-type' in str(meta.get('http-equiv', '')).lower():
-                                meta.decompose()
-                        
-                        # 🚨 【完全解決】自作パース関数でオッズテーブルを無敵ロード！
-                        df_odds_scraped = parse_html_table_safe(str(odds_soup))
-                        
-                        if df_odds_scraped is not None:
-                            col_check = "".join(df_odds_scraped.columns)
-                            c_num = next((c for c in df_odds_scraped.columns if '馬番' in str(c)), None)
-                            c_win = next((c for c in df_odds_scraped.columns if '単勝' in str(c) or 'オッズ' in str(c)), None)
-                            c_place = next((c for c in df_odds_scraped.columns if '複勝' in str(c)), None)
-                            
-                            if c_num is not None:
-                                temp_odds = pd.DataFrame()
-                                temp_odds['馬番'] = pd.to_numeric(df_odds_scraped[c_num], errors='coerce')
-                                
-                                if c_win is not None:
-                                    temp_odds['単勝_raw'] = df_odds_scraped[c_win].astype(str)
-                                    temp_odds['単勝オッズ'] = temp_odds['単勝_raw'].str.extract(r'([0-9.]+)')[0].astype(float)
-                                
-                                if c_place is not None:
-                                    temp_odds['複勝_raw'] = df_odds_scraped[c_place].astype(str)
-                                    temp_odds['複勝オッズ'] = temp_odds['複勝_raw'].str.extract(r'([0-9.]+)')[0].astype(float)
-                                
-                                temp_odds = temp_odds.dropna(subset=['馬番']).drop_duplicates(subset=['馬番'])
-                                df_predict = pd.merge(df_predict.drop(columns=['単勝オッズ', '複勝オッズ'], errors='ignore'), temp_odds[['馬番', '単勝オッズ', '複勝オッズ']], on='馬番', how='left')
-                    except Exception as scrape_err:
-                        st.sidebar.warning(f"⚠️ オッズページの直接スクレイピングに失敗しました。裏APIに切り替えます。({scrape_err})")
-
-                # 🛡️ 【第二防衛線：裏APIからのオッズ自動補完処理】
-                if df_predict['単勝オッズ'].isna().any() or df_predict['複勝オッズ'].isna().any():
-                    if race_id_match:
-                        try:
-                            api_url = f"https://race.netkeiba.com/api/api_get_jra_odds.html?type=1&race_id={race_id}&action=init"
-                            api_res = requests.get(api_url, headers=headers)
-                            odds_json = api_res.json()
-                            
-                            if odds_json.get('status') != 'NG' and 'data' in odds_json and 'odds' in odds_json['data']:
-                                odds_data = odds_json['data']['odds']
-                                
-                                # 単勝補完
-                                if '1' in odds_data:
-                                    for umaban_str, vals in odds_data['1'].items():
-                                        umaban = int(umaban_str)
-                                        odds_val = float(vals[0])
-                                        idx = df_predict[df_predict['馬番'] == umaban].index
-                                        if not idx.empty and pd.isna(df_predict.loc[idx, '単勝オッズ']).any():
-                                            df_predict.loc[idx, '単勝オッズ'] = odds_val
-                                            
-                                # 複勝補完
-                                if '2' in odds_data:
-                                    for umaban_str, vals in odds_data['2'].items():
-                                        umaban = int(umaban_str)
-                                        odds_fuku_val = float(vals[0])
-                                        idx = df_predict[df_predict['馬番'] == umaban].index
-                                        if not idx.empty and pd.isna(df_predict.loc[idx, '複勝オッズ']).any():
-                                            df_predict.loc[idx, '複勝オッズ'] = odds_fuku_val
-                        except Exception:
-                            pass
-
-                # 最終セーフガード
-                df_predict['単勝オッズ'] = df_predict['単勝オッズ'].fillna(10.0)
-                df_predict['複勝オッズ'] = df_predict['複勝オッズ'].fillna(2.0)
-
-                def get_past_feature(horse_name, feature_name, default_value):
-                    if horse_name in memory_df.index: return memory_df.loc[horse_name, feature_name]
-                    return default_value
-
-                for col, def_val in zip(['全体過去平均着順', '前走着順', '出走回数', '前走脚質_num', '前走上がり3F', '過去平均上がり3F'], [8.0, 8.0, 1.0, 4.0, 35.0, 35.0]):
-                    df_predict[col] = df_predict['馬名'].apply(lambda x: get_past_feature(x, col, def_val))
-
-                st.session_state.scraped_data = df_predict
-                st.success("🎯 出馬表とリアルタイムオッズの取得に成功しました！")
-                
-            except Exception as e:
-                st.error(f"データの取得に失敗しました: {e}")
-
-# =========================================================
-# 🚀 【ステップ3】五大老クオンツ計算 ＆ 資金配分
-# =========================================================
-if st.session_state.scraped_data is not None:
-    st.write("### 📊 五大老リアルタイムオッズ・ダッシュボード")
-    st.success(f"✅ レース環境を設定しました: **{st.session_state.extracted_info}**")
+for race_id, group in df_test.groupby('race_id'):
+    horses = group['馬番'].values
+    horse_names = group['馬名'].values
+    ranks = group['着順'].values
+    ai_probs = group['pred_win'].values
+    win_odds = group['単勝オッズ'].values
     
-    st.info("💡 取得した最新オッズです。レース直前の変動をシミュレートしたい場合は、表を直接クリックして数値を編集してください。")
-
-    df_edit = st.session_state.scraped_data[['馬番', '馬名', '単勝オッズ', '複勝オッズ']].copy().sort_values('馬番').reset_index(drop=True)
-    edited_df = st.data_editor(
-        df_edit,
-        column_config={
-            "馬番": st.column_config.NumberColumn("馬番", disabled=True),
-            "馬名": st.column_config.TextColumn("馬名", disabled=True),
-            "単勝オッズ": st.column_config.NumberColumn("リアル単勝オッズ ✏️", min_value=1.0, step=0.1, format="%.1f"),
-            "複勝オッズ": st.column_config.NumberColumn("リアル複勝オッズ（下限） ✏️", min_value=1.0, step=0.1, format="%.1f")
-        },
-        hide_index=True, use_container_width=True
-    )
-
-    df_final = st.session_state.scraped_data.copy()
-    win_odds_map = dict(zip(edited_df['馬番'], edited_df['単勝オッズ']))
-    place_odds_map = dict(zip(edited_df['馬番'], edited_df['複勝オッズ']))
-    df_final['単勝オッズ'] = df_final['馬番'].map(win_odds_map)
-    df_final['複勝オッズ'] = df_final['馬番'].map(place_odds_map)
-
-    # =========================================================
-    # 📈 AI五大老合議制アンサンブル（黄金傾斜配分）
-    # =========================================================
-    X_live = df_final[features].fillna(0)
+    r_odds_data = real_odds_cache.get(str(race_id), {})
+    r_win = r_odds_data.get('win', {})
+    r_place = r_odds_data.get('place', {})
+    r_quinella = r_odds_data.get('quinella', {})
+    r_wide = r_odds_data.get('wide', {})
     
-    # 5つの個性的なモデルそれぞれが独立予測
-    preds = {}
-    for name, m in models.items():
-        preds[name] = m.predict(X_live)
+    pub_probs = 1.0 / win_odds
+    pub_probs /= pub_probs.sum()
+    
+    ai_place, ai_quinella, ai_wide = calculate_exact_multi_probabilities(ai_probs)
+    pub_place, pub_quinella, pub_wide = calculate_exact_multi_probabilities(pub_probs)
+    
+    n = len(horses)
+    top3_idx = [i for i, r in enumerate(ranks) if r in [1.0, 2.0, 3.0]]
+    
+    for i in range(n):
+        u1 = str(int(horses[i]))
+        name1 = horse_names[i]
         
-    # 五大老の意思決定比率を実戦傾斜配分！
-    # 徳川家康 (堅実・ベースライン): 35%
-    # 前田利家 (バランス): 25%
-    # 上杉景勝 (頑健・防衛): 20%
-    # 毛利輝元 (大局・相関): 12%
-    # 宇喜多秀家 (一発・穴): 8%
-    weighted_sum = (
-        preds['徳川家康 (堅実)'] * 0.35 +
-        preds['前田利家 (王道)'] * 0.25 +
-        preds['上杉景勝 (頑健)'] * 0.20 +
-        preds['毛利輝元 (大局)'] * 0.12 +
-        preds['宇喜多秀家 (一発)'] * 0.08
-    )
-    df_final['AI_生勝率'] = weighted_sum
-    race_sum = df_final['AI_生勝率'].sum()
-    
-    # 【非線形複勝率キャリブレーション】
-    # ハルヴィル近似モデルを適用。
-    # 圧倒的人気馬の過大評価を防ぎ、妙味中穴を確実に捉える数理モデルです。
-    win_prob = df_final['AI_生勝率'] / (race_sum if race_sum > 0 else 1)
-    df_final['AI複勝率'] = 1 - (1 - win_prob) ** 2.85
-    df_final['AI複勝率'] = df_final['AI複勝率'].clip(0.01, 1.0)
-    
-    df_final['複勝期待値'] = df_final['AI複勝率'] * df_final['複勝オッズ']
-
-    denominator = np.where(df_final['複勝オッズ'] - 1.0 <= 0, 0.001, df_final['複勝オッズ'] - 1.0)
-    df_final['フルケリー割合'] = (df_final['複勝期待値'] - 1.0) / denominator
-    df_final['推奨投資割合'] = df_final['フルケリー割合'].clip(0.0, None) / 4.0
-
-    df_display = df_final[['枠番', '馬番', '馬名', '単勝オッズ', '複勝オッズ', 'AI複勝率', '複勝期待値', '推奨投資割合']].copy()
-    
-    # 各モデルの個別勝率予測をシミュレーション用に追加
-    for name, pred_val in preds.items():
-        # 個別複勝率も同じハルヴィル関数で美しく表示
-        ind_win_prob = pred_val / (sum(pred_val) if sum(pred_val) > 0 else 1)
-        ind_place_prob = 1 - (1 - ind_win_prob) ** 2.85
-        # 🚨 NumPy配列に対してエラーを起こさずに文字列変換を行う安全ハック
-        df_display[f"{name[:4]}予測"] = [f"{v * 100:.1f}%" for v in np.clip(ind_place_prob, 0, 1)]
-
-    df_display['AI複勝率'] = (df_display['AI複勝率'] * 100).map('{:.1f}%'.format)
-
-    def get_signal(row):
-        if float(row['複勝期待値']) >= 1.25: return "🚨 🔥【大黒天・神妙味馬】🔥"
-        elif float(row['複勝期待値']) >= 1.1: return "👍 妙味あり"
-        else: return "ー"
-
-    df_display['AI評価'] = df_display.apply(get_signal, axis=1)
-    df_display['単勝オッズ'] = df_display['単勝オッズ'].map('{:.1f}'.format)
-    df_display['複勝オッズ'] = df_display['複勝オッズ'].map('{:.1f}'.format)
-    df_display['複勝期待値'] = df_display['複勝期待値'].map('{:.2f}'.format)
-    df_display['推奨投資割合'] = (df_display['推奨投資割合'] * 100).map('{:.1f}%'.format)
-
-    st.write("### 📊 大黒天五大老クオンツ・ケリー資金配分投資表")
-    
-    # 5大老それぞれの個別の意見をアコーディオンに格納
-    with st.expander("🕵️ 五大老AI 衆議（それぞれの個別複勝予測率を見る）"):
-        df_council = df_display[['馬番', '馬名', '徳川家康予測', '前田利家予測', '上杉景勝予測', '毛利輝元予測', '宇喜多秀家予測']]
-        st.dataframe(df_council, use_container_width=True, hide_index=True)
+        # 単勝
+        w_odds = r_win.get(u1, win_odds[i])
+        w_ev = ai_probs[i] * w_odds if ai_probs[i] >= MIN_WIN_PROB else 0.0
+        is_win = 1 if ranks[i] == 1.0 else 0
+        all_bets.append({'date': group['race_date'].iloc[0], 'race_id': race_id, 'type': '単勝', 'target': u1, 'name': name1, 'odds': w_odds, 'prob': ai_probs[i], 'ev': w_ev, 'hit': is_win})
         
-    st.dataframe(
-        df_display.style.apply(lambda x: ['background-color: #ffcccc' if '🚨' in str(v) else '' for v in x], axis=1),
-        use_container_width=True
-    )
+        # 複勝
+        actual_p_odds = r_place.get(u1)
+        p_odds = actual_p_odds if actual_p_odds else max(1.1, round(0.80 / pub_place[i] if pub_place[i] > 0 else 1.0, 1))
+        p_ev = ai_place[i] * p_odds if ai_place[i] >= MIN_PLACE_PROB else 0.0
+        is_place = 1 if ranks[i] in [1.0, 2.0, 3.0] else 0
+        all_bets.append({'date': group['race_date'].iloc[0], 'race_id': race_id, 'type': '複勝', 'target': u1, 'name': name1, 'odds': p_odds, 'prob': ai_place[i], 'ev': p_ev, 'hit': is_place})
+        
+        for j in range(i+1, n):
+            u2 = str(int(horses[j]))
+            name2 = horse_names[j]
+            pair_key = f"{sorted([int(u1), int(u2)])[0]}-{sorted([int(u1), int(u2)])[1]}"
+            pair_name = f"{name1} × {name2}"
+            
+            # 馬連
+            actual_q_odds = r_quinella.get(pair_key)
+            q_ai_prob = ai_quinella[i, j] + ai_quinella[j, i]
+            q_pub_prob = pub_quinella[i, j] + pub_quinella[j, i]
+            q_odds = actual_q_odds if actual_q_odds else max(1.5, round(0.775 / q_pub_prob if q_pub_prob > 0 else 1.0, 1))
+            q_ev = q_ai_prob * q_odds if q_ai_prob >= MIN_PAIR_PROB else 0.0
+            is_q_hit = 1 if (ranks[i] in [1.0, 2.0] and ranks[j] in [1.0, 2.0] and ranks[i] != ranks[j]) else 0
+            all_bets.append({'date': group['race_date'].iloc[0], 'race_id': race_id, 'type': '馬連', 'target': pair_key, 'name': pair_name, 'odds': q_odds, 'prob': q_ai_prob, 'ev': q_ev, 'hit': is_q_hit})
+            
+            # ワイド
+            actual_w_odds = r_wide.get(pair_key)
+            w_ai_prob = ai_wide[i, j]
+            w_pub_prob = pub_wide[i, j]
+            w_odds = actual_w_odds if actual_w_odds else max(1.2, round(0.775 / w_pub_prob if w_pub_prob > 0 else 1.0, 1))
+            w_ev = w_ai_prob * w_odds if w_ai_prob >= MIN_PAIR_PROB else 0.0
+            is_w_hit = 1 if (i in top3_idx and j in top3_idx) else 0
+            all_bets.append({'date': group['race_date'].iloc[0], 'race_id': race_id, 'type': 'ワイド', 'target': pair_key, 'name': pair_name, 'odds': w_odds, 'prob': w_ai_prob, 'ev': w_ev, 'hit': is_w_hit})
+
+df_all_bets = pd.DataFrame(all_bets)
+
+# --- シミュレーション実行エンジン ---
+def run_simulation(df_bets, ticket_type, min_ev):
+    df_target = df_bets[(df_bets['type'] == ticket_type) & (df_bets['ev'] >= min_ev)].copy()
+    df_target = df_target.sort_values('date')
+    
+    bankroll = 100000
+    total_inv = 0
+    total_ret = 0
+    hits = 0
+    
+    for _, row in df_target.iterrows():
+        odds = row['odds']
+        prob = row['prob']
+        
+        kelly = (prob * odds - 1.0) / (odds - 1.0) if odds > 1.0 else 0
+        bet_amt = int(bankroll * max(0, kelly) * 0.25)
+        
+        if bet_amt < 100: continue
+        bet_amt = (bet_amt // 100) * 100
+        bet_amt = min(bet_amt, int(bankroll * 0.05), 10000) 
+        bet_amt = min(bet_amt, (bankroll // 100) * 100)
+        if bet_amt < 100: break
+        
+        bankroll -= bet_amt
+        total_inv += bet_amt
+        
+        if row['hit'] == 1:
+            ret = bet_amt * odds
+            bankroll += ret
+            total_ret += ret
+            hits += 1
+            
+    rec = (total_ret / total_inv * 100) if total_inv > 0 else 0
+    hit_rate = (hits / len(df_target) * 100) if len(df_target) > 0 else 0
+    profit = bankroll - 100000
+    
+    return {
+        'type': ticket_type,
+        'ev_cond': f"EV {min_ev:.2f}+",
+        'bets': len(df_target),
+        'hit_rate': hit_rate,
+        'recovery': rec,
+        'profit': profit,
+        'final_bank': bankroll
+    }
+
+scenarios = [
+    ("複勝", 1.10),
+    ("複勝", 1.20),
+    ("単勝", 1.15),
+    ("単勝", 1.25),
+    ("ワイド", 1.15),
+    ("ワイド", 1.30),
+    ("馬連", 1.20),
+    ("馬連", 1.50)
+]
+
+print(f"\n{YELLOW}📊 【ガチ検証】本物オッズ バックテスト結果サマリー (初期:10万 / 100円単位ケリー配分){RESET}")
+print("-" * 85)
+print(f" 券種   | 条件(期待値) | 勝負R数 | 的中率  | 回収率  | 最終資金 (純利益)")
+print("-" * 85)
+
+for t_type, m_ev in scenarios:
+    res = run_simulation(df_all_bets, t_type, m_ev)
+    color = GREEN if res['recovery'] >= 100 else RED
+    print(f" {res['type']:<4} | {res['ev_cond']:<10} | {res['bets']:>5} R | {res['hit_rate']:>5.1f}% | {color}{res['recovery']:>6.1f}%{RESET} | {color}{int(res['final_bank']):>7,} 円 ({int(res['profit']):+,} 円){RESET}")
+
+print("-" * 85)
+
+
+# =========================================================================
+# 💎 【AI厳選】お宝馬券ランキング（複勝・ワイドのおすすめ度表示機能）
+# =========================================================================
+def parse_race_id(race_id_str):
+    # レースID (例: 202606010101 -> 中山 1R)
+    if len(race_id_str) >= 12:
+        place_code = race_id_str[4:6]
+        race_num = int(race_id_str[-2:])
+        places = {"01":"札幌", "02":"函館", "03":"福島", "04":"新潟", "05":"東京", "06":"中山", "07":"中京", "08":"京都", "09":"阪神", "10":"小倉"}
+        place = places.get(place_code, "地方")
+        return f"{place}{race_num:>2}R"
+    return race_id_str
+
+def get_rank(ticket_type, ev):
+    if ticket_type == "複勝":
+        if ev >= 1.25: return f"{CYAN}👑 Sランク{RESET}", 3
+        elif ev >= 1.15: return f"{YELLOW}🔥 Aランク{RESET}", 2
+        elif ev >= 1.10: return f"{GREEN}👍 Bランク{RESET}", 1
+    elif ticket_type == "ワイド":
+        if ev >= 1.30: return f"{CYAN}👑 Sランク{RESET}", 3
+        elif ev >= 1.20: return f"{YELLOW}🔥 Aランク{RESET}", 2
+        elif ev >= 1.15: return f"{GREEN}👍 Bランク{RESET}", 1
+    return "", 0
+
+def get_width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in 'FWA' else 1 for c in s)
+
+def pad_str(s, length):
+    return s + " " * max(0, length - get_width(s))
+
+print(f"\n{CYAN}💎 【AI厳選】春季レース 複勝・ワイド お宝馬券ランキング TOP20 💎{RESET}")
+print(f"💡 AIが「これは絶対に美味しい！」と判断した、期待値（EV）の高い買い目リストです。")
+print("-" * 110)
+print(f" 日付  | レース  | 券種   | おすすめ度  | 期待値 | 予想確率 | オッズ | 買い目 (馬番/馬名)                  | 結果")
+print("-" * 110)
+
+recom_df = df_all_bets[df_all_bets['type'].isin(['複勝', 'ワイド'])].copy()
+recom_df['RankInfo'] = recom_df.apply(lambda row: get_rank(row['type'], row['ev']), axis=1)
+recom_df['RankStr'] = recom_df['RankInfo'].apply(lambda x: x[0])
+recom_df['RankScore'] = recom_df['RankInfo'].apply(lambda x: x[1])
+
+# S・A・Bランクがついたものだけを抽出し、期待値が高い順に20件表示
+recom_df = recom_df[recom_df['RankScore'] > 0]
+recom_df = recom_df.sort_values(by='ev', ascending=False).head(20)
+
+for _, row in recom_df.iterrows():
+    d_str = row['date'].strftime('%m/%d')
+    r_str = pad_str(parse_race_id(str(row['race_id'])), 7)
+    hit_str = f"{YELLOW}🎯 的中!{RESET}" if row['hit'] == 1 else f"{RED}❌ ハズレ{RESET}"
+    
+    t_type = pad_str(row['type'], 6)
+    
+    target_str = f"[{row['target']}]"
+    name_str = row['name']
+    if len(name_str) > 16:
+        name_str = name_str[:15] + "…"
+    combo_str = pad_str(f"{target_str} {name_str}", 35)
+    
+    # ランクのパディング（カラーコードを無視して文字数計算）
+    pure_rank = row['RankStr'].replace('\033[96m', '').replace('\033[93m', '').replace('\033[92m', '').replace('\033[0m', '')
+    rank_padded = row['RankStr'] + " " * max(0, 11 - get_width(pure_rank))
+
+    print(f" {d_str} | {r_str} | {t_type} | {rank_padded} | EV{row['ev']:.2f} |  {row['prob']*100:>4.1f}% | {row['odds']:>5.1f}倍 | {combo_str} | {hit_str}")
+
+print("-" * 110)
