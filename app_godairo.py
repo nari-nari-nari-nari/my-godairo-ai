@@ -9,11 +9,11 @@ import requests
 
 # --- ページ設定 ---
 st.set_page_config(page_title="🔱大黒天AI V6", layout="wide")
-st.title("🔱 大黒天AI V6 - 五大老全員集結・完全実戦版")
+st.title("🔱 大黒天AI V6 - 柔軟ハイブリッド実戦版")
 
-# --- 軽量モデルと過去の記憶のロード（厳密チェックモード） ---
+# --- 軽量モデルと過去の記憶のロード（柔軟チェックモード） ---
 @st.cache_resource
-def load_models_strict():
+def load_models():
     model_files = {
         "徳川家康予測": "model_ieyasu.txt",
         "前田利家予測": "model_toshiie.txt",
@@ -27,7 +27,7 @@ def load_models_strict():
         if os.path.exists(path):
             loaded[name] = lgb.Booster(model_file=path)
         else:
-            missing.append(path)
+            missing.append(name) # 誰がいないか記録
     return loaded, missing
 
 @st.cache_data
@@ -47,16 +47,15 @@ def load_mappings():
         pass
     return j_map, t_map, mem_df
 
-models, missing_models = load_models_strict()
+models, missing_models = load_models()
 jockey_map, trainer_map, memory_df = load_mappings()
 
-# 👑 5人揃っていない場合は画面上でストップさせる
-if missing_models:
-    st.error("❌【至急】5人全員で予想するためには、以下のファイルがGitHubに足りません！")
-    for f in missing_models:
-        st.markdown(f"- **`{f}`**")
-    st.info("💡 上記のファイルをGitHubにアップロードすると、この警告が消えて予想が開始されます。")
+# 👑 ここが柔軟ポイント！警告は出すけど、計算は止めない！
+if not models:
+    st.error("❌ モデルファイルが1つも見つかりません。GitHubを確認してください。")
     st.stop()
+elif missing_models:
+    st.warning(f"⚠️ 一部のAI（{', '.join(missing_models)}）が欠席しています。現在いるメンバーだけで衆議を行います。")
 
 # --- 超・ガバガバ読み取り機能 ---
 def parse_pasted_text(text):
@@ -145,7 +144,7 @@ course_num = {"芝": 0, "ダート": 1, "障害": 2}[course_type]
 weather_num = {"晴": 0, "曇": 1, "小雨": 2, "雨": 3, "雪": 4}[weather]
 ground_num = {"良": 0, "稍重": 1, "重": 2, "不良": 3}[ground]
 
-if st.sidebar.button("🔱 5人全員で予想を実行"):
+if st.sidebar.button("🔱 予想・ケリー計算を実行"):
     if not pasted_text.strip():
         st.warning("⚠️ テキスト枠に出馬表をコピペしてください。")
         st.stop()
@@ -163,7 +162,7 @@ if st.sidebar.button("🔱 5人全員で予想を実行"):
         df_race['単勝オッズ'] = df_race['馬番'].map(lambda x: real_odds['win'].get(x, 10.0))
         df_race['複勝オッズ_下限'] = df_race['馬番'].map(lambda x: real_odds['place'].get(x, 1.1))
         
-        st.success(f"✅ 【五大老 衆議開始】{len(df_race)}頭のデータを読み込み、5人全員での予測を開始します！")
+        st.success(f"✅ 【抽出成功】{len(df_race)}頭のデータを読み込みました！")
         
         df_pred = df_race.copy()
         df_pred['コース_num'] = course_num
@@ -199,13 +198,15 @@ if st.sidebar.button("🔱 5人全員で予想を実行"):
         
         X_pred = df_pred[features].fillna(0)
         
-        model_cols = ['徳川家康予測', '前田利家予測', '上杉景勝予測', '毛利輝元予測', '宇喜多秀家予測']
-        for name, model in models.items():
+        # 👑 実際に読み込めたモデルだけで予測してエラーを完全回避
+        loaded_model_cols = list(models.keys())
+        for name in loaded_model_cols:
+            model = models[name]
             preds = model.predict(X_pred)
             win_prob = preds / (preds.sum() if preds.sum() > 0 else 1)
             df_race[name] = np.clip(1 - (1 - win_prob) ** 2.85, 0, 1)
             
-        df_race['AI複勝率_num'] = df_race[model_cols].mean(axis=1)
+        df_race['AI複勝率_num'] = df_race[loaded_model_cols].mean(axis=1)
         df_race['複勝期待値(EV)'] = df_race['AI複勝率_num'] * df_race['複勝オッズ_下限']
         
         df_race['b_value'] = df_race['複勝オッズ_下限'] - 1.0
@@ -227,16 +228,15 @@ if st.sidebar.button("🔱 5人全員で予想を実行"):
         df_race['おすすめ度'] = df_race.apply(lambda row: get_rank(row['複勝期待値(EV)'], row['推奨金額(円)']), axis=1)
         
         df_race['AI複勝率'] = (df_race['AI複勝率_num'] * 100).map('{:.1f}%'.format)
-        for col in model_cols:
+        for col in loaded_model_cols:
             df_race[col] = (df_race[col] * 100).map('{:.1f}%'.format)
             
-        st.write(f"### 🏆 5人衆議・お宝馬券ランキング（予算: {budget:,}円）")
+        st.write(f"### 🏆 お宝馬券ランキング（予算: {budget:,}円）")
         df_final = df_race[['馬番', '馬名', '複勝オッズ_下限', 'AI複勝率', '複勝期待値(EV)', '推奨金額(円)', 'おすすめ度']].copy()
         df_final['複勝期待値(EV)'] = df_final['複勝期待値(EV)'].map('{:.2f}'.format)
         
         st.dataframe(df_final.sort_values(by=['推奨金額(円)', '複勝期待値(EV)'], ascending=[False, False]), use_container_width=True, hide_index=True)
         
         with st.expander("🕵️ 五大老AI 衆議詳細（個別予測・単勝オッズ）"):
-            cols_to_show = ['馬番', '馬名', '単勝オッズ'] + model_cols
+            cols_to_show = ['馬番', '馬名', '単勝オッズ'] + loaded_model_cols
             st.dataframe(df_race[cols_to_show], use_container_width=True, hide_index=True)
-
