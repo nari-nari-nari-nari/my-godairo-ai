@@ -9,113 +9,6 @@ import requests
 
 # --- ページ設定 ---
 st.set_page_config(page_title="🔱大黒天AI V6", layout="wide")
-st.title("🔱 大黒天AI V6 - 期待値＆ケリー基準搭載版")
-
-# --- 軽量モデルと過去の記憶のロード ---
-@st.cache_resource
-def load_models():
-    model_files = {
-        "徳川家康予測": "model_ieyasu.txt",
-        "前田利家予測": "model_toshiie.txt",
-        "上杉景勝予測": "model_kagekatsu.txt",
-        "毛利輝元予測": "model_terumoto.txt",
-        "宇喜多秀家予測": "model_hideie.txt"
-    }
-    loaded = {}
-    for name, path in model_files.items():
-        if os.path.exists(path):
-            loaded[name] = lgb.Booster(model_file=path)
-    return loaded
-
-@st.cache_data
-def load_mappings():
-    j_map, t_map = {}, {}
-    mem_df = pd.DataFrame()
-    try:
-        if os.path.exists("jockey_map.json"):
-            with open("jockey_map.json", "r", encoding="utf-8") as f: j_map = json.load(f)
-        if os.path.exists("trainer_map.json"):
-            with open("trainer_map.json", "r", encoding="utf-8") as f: t_map = json.load(f)
-        if os.path.exists("lite_memory_df.csv"):
-            temp_df = pd.read_csv("lite_memory_df.csv")
-            if '馬名' in temp_df.columns:
-                mem_df = temp_df.set_index('馬名')
-    except Exception:
-        pass
-    return j_map, t_map, mem_df
-
-models = load_models()
-jockey_map, trainer_map, memory_df = load_mappings()
-
-# --- 超・ガバガバ読み取り機能 ---
-def parse_pasted_text(text):
-    horses_data = []
-    lines = text.split('\n')
-    current_umaban = None
-    
-    for line in lines:
-        line = line.strip()
-        if not line: continue
-        
-        if re.match(r'^\d+$', line):
-            num = int(line)
-            if 1 <= num <= 18:
-                current_umaban = num
-                continue
-                
-        m_same = re.match(r'^(\d+)\s+([ァ-ンヴー・]{2,9})', line)
-        if m_same:
-            umaban = int(m_same.group(1))
-            name = m_same.group(2)
-            if 1 <= umaban <= 18 and not any(h['馬番'] == umaban for h in horses_data):
-                horses_data.append({'馬番': umaban, '馬名': name, '枠番':0, '単勝オッズ_仮':10.0})
-            current_umaban = None
-            continue
-            
-        m_name = re.search(r'^[ァ-ンヴー・]{2,9}', line)
-        if m_name and current_umaban is not None:
-            name = m_name.group(0)
-            if not any(h['馬番'] == current_umaban for h in horses_data):
-                horses_data.append({'馬番': current_umaban, '馬名': name, '枠番':0, '単勝オッズ_仮':10.0})
-            current_umaban = None
-            continue
-
-    if not horses_data:
-        names = re.findall(r'[ァ-ンヴー・]{2,9}', text)
-        ignore_list = ['ルメール', 'デムーロ', 'モレイラ', 'マーカンド', 'ムルザバ', 'レーン', 'ダート', 'コース']
-        filtered_names = [n for n in names if n not in ignore_list]
-        
-        seen = set()
-        unique_names = []
-        for n in filtered_names:
-            if n not in seen:
-                unique_names.append(n)
-                seen.add(n)
-                
-        for i, name in enumerate(unique_names):
-            if i >= 18: break
-            horses_data.append({'馬番': i+1, '馬名': name, '枠番':0, '単勝オッズ_仮':10.0})
-
-    return pd.DataFrame(horses_data) if horses_data else None
-
-# --- ネット競馬の裏APIから「最新オッズ」だけを抜く ---
-def fetch_real_odds(race_id):
-    base_url = "https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={}&action=init&type=1"
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    odds_dict = {'win': {}, 'place': {}}
-    try:
-        res = requests.get(base_url.format(race_id), headers=headers, timeout=5)
-        d = res.json().get('data', {}).get('odds', {})
-        if '1' in d:
-            for k, v in d['1'].items(): odds_dict['win'][int(k)] = float(v[0])
-        if '2' in d:
-            for k, v in d['2'].items(): odds_dict['place'][int(k)] = float(v[0])
-    except Exception:
-        pass
-    return odds_dict
-
-# --- サイドバー：予想設定 ---
-st.sidebar.header("🎯 実戦レース設定")
 url_input = st.sidebar.text_input("① レースのURL (オッズ取得用)", "")
 st.sidebar.markdown("② 出馬表を「適当に全部コピー」してペースト")
 pasted_text = st.sidebar.text_area("", height=150)
@@ -236,4 +129,4 @@ if st.sidebar.button("🔱 予想・ケリー計算を実行"):
         
         with st.expander("🕵️ 五大老AI 衆議（個別予測・単勝オッズ）"):
             cols_to_show = ['馬番', '馬名', '単勝オッズ'] + model_cols
-            st.dataframe(df_race[cols_to_show], use_container_width=True, hide_index=True)
+            st.dataframe(df_raceお[cols_to_show], use_container_width=True, hide_index=True)
