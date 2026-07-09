@@ -205,8 +205,9 @@ if st.sidebar.button("🔱 予想・ケリー計算を実行"):
     if df_race is None or df_race.empty:
         st.error("❌ 抽出不可能なレベルのテキストです。もう一度コピペしてみてください。")
     else:
-        df_race['単勝オッズ'] = df_race['馬番'].map(lambda x: real_odds['win'].get(x, 10.0))
-        df_race['複勝オッズ_下限'] = df_race['馬番'].map(lambda x: real_odds['place'].get(x, 1.1))
+        # オッズが取れなかった幽霊馬は1.1倍ではなく「0.0倍」にして誤爆を防ぐ！
+        df_race['単勝オッズ'] = df_race['馬番'].map(lambda x: real_odds['win'].get(x, 0.0))
+        df_race['複勝オッズ_下限'] = df_race['馬番'].map(lambda x: real_odds['place'].get(x, 0.0))
         
         st.success(f"✅ 【抽出成功】{len(df_race)}頭の馬名を発見し、最新オッズを結合しました！")
         
@@ -379,9 +380,9 @@ if st.sidebar.button("🔱 予想・ケリー計算を実行"):
         # 🌟 NEW! すべての組み合わせの期待値をランキングで確認できるボタンを追加
         with st.expander("📊 すべての馬連・ワイドの確率・期待値一覧を見る（オッズ取得失敗時も確率は確認可能）"):
             if not df_all_pairs.empty:
-                # オッズが0の場合は「---」などの文字に変換
-                df_all_pairs['期待値(EV)'] = df_all_pairs['期待値(EV)'].apply(lambda x: f"{x:.2f}" if x > 0 else "---")
-                df_all_pairs['オッズ'] = df_all_pairs['オッズ'].apply(lambda x: f"{x:.1f}" if x > 0 else "---")
+                # オッズが0または文字列の場合は「---」などの文字に変換
+                df_all_pairs['期待値(EV)'] = df_all_pairs['期待値(EV)'].apply(lambda x: f"{float(x):.2f}" if isinstance(x, (int, float)) and x > 0 else "---")
+                df_all_pairs['オッズ'] = df_all_pairs['オッズ'].apply(lambda x: f"{float(x):.1f}" if isinstance(x, (int, float)) and x > 0 else "---")
                 df_all_pairs['確率_num'] = df_all_pairs['確率'] # ソート用に数値を残す
                 df_all_pairs['確率'] = (df_all_pairs['確率'] * 100).map('{:.1f}%'.format)
                 
