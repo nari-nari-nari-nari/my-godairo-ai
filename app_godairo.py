@@ -55,6 +55,7 @@ def fetch_race_details(race_id):
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
         'Referer': 'https://race.netkeiba.com/',
         'Connection': 'keep-alive'
@@ -67,17 +68,25 @@ def fetch_race_details(race_id):
         res.encoding = 'EUC-JP'
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 1. 出馬表の抽出
+        # 1. 出馬表の抽出（構造が複雑でも確実に拾えるように強化）
         horses = []
-        for tr in soup.select('.HorseList'):
-            umaban_el = tr.select_one('.Umaban')
-            name_el = tr.select_one('.HorseInfo a')
+        for tr in soup.select('tr.HorseList'):
+            umaban_el = tr.select_one('td[class*="Umaban"]')
+            if not umaban_el:
+                umaban_el = tr.select_one('.Umaban')
+            name_el = tr.select_one('.HorseName a')
+            if not name_el:
+                name_el = tr.select_one('.HorseInfo a')
+                
             if umaban_el and name_el:
-                horses.append({
-                    '馬番': int(umaban_el.text.strip()),
-                    '馬名': name_el.text.strip(),
-                    '枠番': 0, '単勝オッズ_仮': 10.0
-                })
+                try:
+                    horses.append({
+                        '馬番': int(umaban_el.text.strip()),
+                        '馬名': name_el.text.strip(),
+                        '枠番': 0, '単勝オッズ_仮': 10.0
+                    })
+                except ValueError:
+                    pass
         df_horses = pd.DataFrame(horses) if horses else None
         
         # 2. レース条件の抽出（例：芝1600m / 天候:晴 / 芝: 良）
@@ -128,6 +137,7 @@ def fetch_real_odds(race_id):
     base_url = "https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={}&action=init&type={}"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
         'Referer': f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}",
         'X-Requested-With': 'XMLHttpRequest'
     }
@@ -226,8 +236,8 @@ if auto_predict_btn or manual_predict_btn:
     m = re.search(r'race_id=(\d+)', url_input)
     race_id = m.group(1) if m else url_input.strip()
     
-    if not race_id and auto_predict_btn:
-        st.warning("⚠️ 自動予想にはURL（またはrace_id）の入力が必要です。")
+    if not race_id:
+        st.warning("⚠️ 【重要】オッズを取得するために「① レースのURL」の入力が必須です。手動モードの場合も必ず入力してください。")
         st.stop()
         
     race_num_str = "??"
@@ -260,6 +270,10 @@ if auto_predict_btn or manual_predict_btn:
 
         # 🎯 オッズの取得と結合
         real_odds = fetch_real_odds(race_id) if race_id else {'win': {}, 'place': {}, 'quinella': {}, 'wide': {}}
+        
+        if not real_odds['win']:
+            st.error("⚠️ リアルタイムオッズが0件です！金曜日の昼間など、まだオッズが発表されていない時間帯の可能性があります。")
+            
         df_race['単勝オッズ'] = df_race['馬番'].map(lambda x: real_odds['win'].get(x, 0.0))
         df_race['複勝オッズ_下限'] = df_race['馬番'].map(lambda x: real_odds['place'].get(x, 0.0))
         
