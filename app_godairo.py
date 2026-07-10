@@ -6,12 +6,15 @@ import os
 import json
 import re
 import requests
+import time
+import random
+from bs4 import BeautifulSoup
 
 # --- ページ設定 ---
 st.set_page_config(page_title="🔱大黒天AI V7", layout="wide")
-st.title("🔱 大黒天AI V7 - 全券種（馬連・ワイド）ケリー基準搭載版")
+st.title("🔱 大黒天AI V7 - 全券種ケリー搭載 ＆ 一撃自動予想モード")
 
-# --- 軽量モデルと過去の記憶のロード (v7としてキャッシュを強制リセット) ---
+# --- 軽量モデルと過去の記憶のロード ---
 @st.cache_resource(show_spinner=False)
 def load_models_v7():
     model_files = {
@@ -47,81 +50,113 @@ def load_mappings_v7():
 models = load_models_v7()
 jockey_map, trainer_map, memory_df = load_mappings_v7()
 
-# --- 超・ガバガバ読み取り機能 ---
+# --- 🤖 [NEW] URLから出馬表とレース条件を全自動スクレイピング ---
+def fetch_race_details(race_id):
+    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+        'Referer': 'https://race.netkeiba.com/',
+        'Connection': 'keep-alive'
+    }
+    try:
+        # ステルス対策：アクセス前に0.5〜1.5秒のランダムな待機時間を入れる
+        time.sleep(random.uniform(0.5, 1.5))
+        
+        res = requests.get(url, headers=headers, timeout=10)
+        res.encoding = 'EUC-JP'
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # 1. 出馬表の抽出
+        horses = []
+        for tr in soup.select('.HorseList'):
+            umaban_el = tr.select_one('.Umaban')
+            name_el = tr.select_one('.HorseInfo a')
+            if umaban_el and name_el:
+                horses.append({
+                    '馬番': int(umaban_el.text.strip()),
+                    '馬名': name_el.text.strip(),
+                    '枠番': 0, '単勝オッズ_仮': 10.0
+                })
+        df_horses = pd.DataFrame(horses) if horses else None
+        
+        # 2. レース条件の抽出（例：芝1600m / 天候:晴 / 芝: 良）
+        race_data = soup.select_one('.RaceData01')
+        race_text = race_data.text if race_data else ""
+        
+        course = "芝"
+        if "ダ" in race_text: course = "ダート"
+        elif "障" in race_text: course = "障害"
+        
+        dist_m = re.search(r'\d{4}', race_text)
+        distance = int(dist_m.group()) if dist_m else 1600
+        
+        weather = "晴"
+        for w in ["雪", "雨", "小雨", "曇", "晴"]:
+            if w in race_text: weather = w; break
+                
+        ground = "良"
+        for g in ["不良", "重", "稍重", "良"]:
+            if g in race_text: ground = g; break
+                
+        return df_horses, course, distance, weather, ground
+    except Exception:
+        return None, "芝", 1600, "晴", "良"
+
+# --- 超・ガバガバ読み取り機能 (手動入力用) ---
 def parse_pasted_text(text):
     horses_data = []
-    lines = text.split('\n')
-    current_umaban = None
-    
-    for line in lines:
+    for line in text.split('\n'):
         line = line.strip()
         if not line: continue
-        
-        if re.match(r'^\d+$', line):
-            num = int(line)
-            if 1 <= num <= 18:
-                current_umaban = num
-                continue
-                
         m_same = re.match(r'^(\d+)\s+([ァ-ンヴー・]{2,9})', line)
         if m_same:
-            umaban = int(m_same.group(1))
-            name = m_same.group(2)
-            if 1 <= umaban <= 18 and not any(h['馬番'] == umaban for h in horses_data):
-                horses_data.append({'馬番': umaban, '馬名': name, '枠番':0, '単勝オッズ_仮':10.0})
-            current_umaban = None
-            continue
-            
-        m_name = re.search(r'^[ァ-ンヴー・]{2,9}', line)
-        if m_name and current_umaban is not None:
-            name = m_name.group(0)
-            if not any(h['馬番'] == current_umaban for h in horses_data):
-                horses_data.append({'馬番': current_umaban, '馬名': name, '枠番':0, '単勝オッズ_仮':10.0})
-            current_umaban = None
-            continue
-
+            horses_data.append({'馬番': int(m_same.group(1)), '馬名': m_same.group(2), '枠番':0, '単勝オッズ_仮':10.0})
+    
     if not horses_data:
-        names = re.findall(r'[ァ-ンヴー・]{2,9}', text)
         ignore_list = ['ルメール', 'デムーロ', 'モレイラ', 'マーカンド', 'ムルザバ', 'レーン', 'ダート', 'コース']
-        filtered_names = [n for n in names if n not in ignore_list]
-        
+        names = [n for n in re.findall(r'[ァ-ンヴー・]{2,9}', text) if n not in ignore_list]
         seen = set()
-        unique_names = []
-        for n in filtered_names:
-            if n not in seen:
-                unique_names.append(n)
-                seen.add(n)
-                
+        unique_names = [n for n in names if not (n in seen or seen.add(n))]
         for i, name in enumerate(unique_names):
             if i >= 18: break
             horses_data.append({'馬番': i+1, '馬名': name, '枠番':0, '単勝オッズ_仮':10.0})
-
     return pd.DataFrame(horses_data) if horses_data else None
 
 # --- 🎯 馬連・ワイド対応 最新オッズ取得API ---
 def fetch_real_odds(race_id):
     base_url = "https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={}&action=init&type={}"
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Referer': f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}",
+        'X-Requested-With': 'XMLHttpRequest'
+    }
     odds_dict = {'win': {}, 'place': {}, 'quinella': {}, 'wide': {}}
+    
+    # Sessionを使ってクッキーを維持し、人間と同じようなアクセスを装う
+    session = requests.Session()
+    session.headers.update(headers)
+    
     try:
-        # 単勝(1)・複勝(2)
-        res1 = requests.get(base_url.format(race_id, 1), headers=headers, timeout=5)
+        # ステルス対策：各APIリクエストの間にランダムな待機時間（0.5〜1.2秒）を挟む
+        time.sleep(random.uniform(0.5, 1.2))
+        res1 = session.get(base_url.format(race_id, 1), timeout=10)
         d1 = res1.json().get('data', {}).get('odds', {})
         if '1' in d1:
             for k, v in d1['1'].items(): odds_dict['win'][int(k)] = float(v[0])
         if '2' in d1:
             for k, v in d1['2'].items(): odds_dict['place'][int(k)] = float(v[0])
             
-        # 馬連(3) ※以前は4(馬単)になっていたバグを修正
-        res3 = requests.get(base_url.format(race_id, 3), headers=headers, timeout=5)
-        d3 = res3.json().get('data', {}).get('odds', {})
-        for k1, v1_dict in d3.items():
+        time.sleep(random.uniform(0.5, 1.2))
+        res4 = session.get(base_url.format(race_id, 4), timeout=10)
+        d4 = res4.json().get('data', {}).get('odds', {})
+        for k1, v1_dict in d4.items():
             for k2, v2 in v1_dict.items():
                 u1, u2 = sorted([int(k1), int(k2)])
                 odds_dict['quinella'][f"{u1}-{u2}"] = float(v2[0])
                 
-        # ワイド(5)
-        res5 = requests.get(base_url.format(race_id, 5), headers=headers, timeout=5)
+        time.sleep(random.uniform(0.5, 1.2))
+        res5 = session.get(base_url.format(race_id, 5), timeout=10)
         d5 = res5.json().get('data', {}).get('odds', {})
         for k1, v1_dict in d5.items():
             for k2, v2 in v1_dict.items():
@@ -137,9 +172,7 @@ def calculate_exact_multi_probabilities(win_probs):
     eps = 1e-9
     win_probs = np.array(win_probs) + eps
     win_probs /= win_probs.sum()
-    place = np.zeros(n)
-    quinella = np.zeros((n, n))
-    wide = np.zeros((n, n))
+    place, quinella, wide = np.zeros(n), np.zeros((n, n)), np.zeros((n, n))
     for i in range(n):
         p1 = win_probs[i]
         for j in range(n):
@@ -151,70 +184,95 @@ def calculate_exact_multi_probabilities(win_probs):
                 denom = 1.0 - p1 - win_probs[j]
                 p3 = win_probs[k] / denom if denom > 0 else 0
                 p123 = p1 * p2 * p3
-                place[i] += p123
-                place[j] += p123
-                place[k] += p123
-                wide[i, j] += p123
-                wide[j, k] += p123
-                wide[i, k] += p123
+                place[i] += p123; place[j] += p123; place[k] += p123
+                wide[i, j] += p123; wide[j, k] += p123; wide[i, k] += p123
     return place, quinella, wide / 2.0
 
-# --- サイドバー：予想設定 ---
-st.sidebar.header("🎯 実戦レース設定")
-url_input = st.sidebar.text_input("① レースのURL (オッズ取得用)", "")
-st.sidebar.markdown("② 出馬表を「適当に全部コピー」してペースト")
-pasted_text = st.sidebar.text_area("", height=150)
+
+# ==========================================
+# 🖥️ サイドバー：予想設定（一撃モード対応）
+# ==========================================
+st.sidebar.header("🎯 🚀 超・一撃予想モード")
+st.sidebar.markdown("URLを貼るだけで、**出馬表・距離・天候・馬場・開催場**を裏側で自動ハッキングして予想します！")
+
+url_input = st.sidebar.text_input("① レースのURL (または race_id)", placeholder="https://race.netkeiba.com/...")
+budget = st.sidebar.number_input("② 今回の軍資金 (円)", value=10000, step=1000)
+
+# 🌟 メインの自動実行ボタン
+auto_predict_btn = st.sidebar.button("🚀 URLから全自動で予想を実行！", type="primary")
 
 st.sidebar.markdown("---")
-budget = st.sidebar.number_input("💸 今回の軍資金 (円)", value=10000, step=1000)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("🌤️ レース条件（手動入力）")
-venue = st.sidebar.selectbox("開催場", ["東京", "中山", "京都", "阪神", "中京", "札幌", "函館", "福島", "新潟", "小倉", "大井", "川崎", "船橋", "浦和", "その他"])
-course_type = st.sidebar.selectbox("コース", ["芝", "ダート", "障害"])
-distance = st.sidebar.number_input("距離(m)", value=1600, step=100)
-weather = st.sidebar.selectbox("天候", ["晴", "曇", "小雨", "雨", "雪"])
-ground = st.sidebar.selectbox("馬場", ["良", "稍重", "重", "不良"])
+# 🌟 失敗時用の手動モード（折りたたみ）
+with st.sidebar.expander("🛠️ 手動補正モード（自動取得に失敗した時用）"):
+    st.markdown("出馬表を「適当に全部コピー」してペースト")
+    pasted_text = st.text_area("出馬表コピペエリア", height=100)
+    venue = st.selectbox("開催場", ["東京", "中山", "京都", "阪神", "中京", "札幌", "函館", "福島", "新潟", "小倉", "大井", "川崎", "船橋", "浦和", "その他"])
+    course_type = st.selectbox("コース", ["芝", "ダート", "障害"])
+    distance_manual = st.number_input("距離(m)", value=1600, step=100)
+    weather = st.selectbox("天候", ["晴", "曇", "小雨", "雨", "雪"])
+    ground = st.selectbox("馬場", ["良", "稍重", "重", "不良"])
+    manual_predict_btn = st.button("🛠️ 手動入力データで予想を実行")
 
-venue_dict = {"東京": 0, "中山": 1, "京都": 2, "阪神": 3, "中京": 4, "札幌": 5, "函館": 6, "福島": 7, "新潟": 8, "小倉": 9, "大井": 10, "川崎": 11, "船橋": 12, "浦和": 13, "その他": 14}
-venue_num = venue_dict[venue]
-course_num = {"芝": 0, "ダート": 1, "障害": 2}[course_type]
-weather_num = {"晴": 0, "曇": 1, "小雨": 2, "雨": 3, "雪": 4}[weather]
-ground_num = {"良": 0, "稍重": 1, "重": 2, "不良": 3}[ground]
 
-if st.sidebar.button("🔱 予想・ケリー計算を実行"):
+# ==========================================
+# ⚙️ 実行ロジック
+# ==========================================
+if auto_predict_btn or manual_predict_btn:
     if not models:
         st.error("モデルファイルが見つかりません。")
-        st.stop()
-        
-    if not pasted_text.strip():
-        st.warning("⚠️ テキスト枠に出馬表をコピペしてください。")
         st.stop()
         
     m = re.search(r'race_id=(\d+)', url_input)
     race_id = m.group(1) if m else url_input.strip()
     
+    if not race_id and auto_predict_btn:
+        st.warning("⚠️ 自動予想にはURL（またはrace_id）の入力が必要です。")
+        st.stop()
+        
     race_num_str = "??"
     if race_id and len(race_id) >= 2 and race_id[-2:].isdigit():
         race_num_str = str(int(race_id[-2:]))
         
-    with st.spinner(f"🏇 {venue} {race_num_str}R のデータを抽出＆オッズ計算中..."):
-        df_race = parse_pasted_text(pasted_text)
-        real_odds = fetch_real_odds(race_id) if race_id else {'win': {}, 'place': {}, 'quinella': {}, 'wide': {}}
+    # URLから開催場を自動判別
+    place_map = {"01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京", "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉"}
+    v_name = "その他"
+    if race_id and len(race_id) >= 6:
+        v_name = place_map.get(race_id[4:6], "その他")
+
+    with st.spinner(f"🏇 {v_name} {race_num_str}R のデータを裏側でスクレイピング＆計算中..."):
         
-    if df_race is None or df_race.empty:
-        st.error("❌ 抽出不可能なレベルのテキストです。もう一度コピペしてみてください。")
-    else:
-        # オッズが取れなかった幽霊馬は1.1倍ではなく「0.0倍」にして誤爆を防ぐ！
+        # 🤖 自動モード or 手動モードの分岐
+        if auto_predict_btn:
+            df_race, c_type, dist, wea, gro = fetch_race_details(race_id)
+            if df_race is None or df_race.empty:
+                st.error("❌ 出馬表の自動取得に失敗しました。URLが間違っているか、手動モードをご利用ください。")
+                st.stop()
+            st.success(f"✅ 【一撃ハッキング成功】 {v_name} {dist}m ({c_type}) / 天候:{wea} / 馬場:{gro} / {len(df_race)}頭立て")
+        else:
+            df_race = parse_pasted_text(pasted_text)
+            c_type, dist, wea, gro = course_type, distance_manual, weather, ground
+            v_name = venue
+            if df_race is None or df_race.empty:
+                st.error("❌ 手動抽出不可能なレベルのテキストです。")
+                st.stop()
+            st.success(f"✅ 【手動抽出成功】 {len(df_race)}頭の馬名を発見しました。")
+
+        # 🎯 オッズの取得と結合
+        real_odds = fetch_real_odds(race_id) if race_id else {'win': {}, 'place': {}, 'quinella': {}, 'wide': {}}
         df_race['単勝オッズ'] = df_race['馬番'].map(lambda x: real_odds['win'].get(x, 0.0))
         df_race['複勝オッズ_下限'] = df_race['馬番'].map(lambda x: real_odds['place'].get(x, 0.0))
         
-        st.success(f"✅ 【抽出成功】{len(df_race)}頭の馬名を発見し、最新オッズを結合しました！")
-        
+        # 🎯 特徴量変換
+        venue_dict = {"東京": 0, "中山": 1, "京都": 2, "阪神": 3, "中京": 4, "札幌": 5, "函館": 6, "福島": 7, "新潟": 8, "小倉": 9, "大井": 10, "川崎": 11, "船橋": 12, "浦和": 13, "その他": 14}
+        course_num = {"芝": 0, "ダート": 1, "障害": 2}.get(c_type, 0)
+        weather_num = {"晴": 0, "曇": 1, "小雨": 2, "雨": 3, "雪": 4}.get(wea, 0)
+        ground_num = {"良": 0, "稍重": 1, "重": 2, "不良": 3}.get(gro, 0)
+
         df_pred = df_race.copy()
         df_pred['コース_num'] = course_num
-        df_pred['開催場_num'] = venue_num
-        df_pred['距離'] = distance
+        df_pred['開催場_num'] = venue_dict.get(v_name, 14)
+        df_pred['距離'] = dist
         df_pred['天候_num'] = weather_num
         df_pred['馬場状態_num'] = ground_num
         df_pred['斤量_num'] = 55.0
@@ -281,9 +339,8 @@ if st.sidebar.button("🔱 予想・ケリー計算を実行"):
             
         df_race['おすすめ度'] = df_race.apply(lambda row: get_rank(row['複勝期待値(EV)'], row['推奨金額(円)']), axis=1)
         
-        # --- 買い目リスト(EV 1.15以上) と 全一覧用リスト(全て) を作成 ---
         pair_bets = []
-        all_pair_stats = [] # 🌟 すべての組み合わせを保存する新しいリスト
+        all_pair_stats = []
         
         n = len(df_race)
         horses = df_race['馬番'].values
@@ -299,20 +356,11 @@ if st.sidebar.button("🔱 予想・ケリー計算を実行"):
                 pair_key = f"{min(u1, u2)}-{max(u1, u2)}"
                 pair_name = f"{name1} × {name2}"
                 
-                # 馬連
                 q_odds = r_quinella.get(pair_key, 0)
                 q_prob = ai_quinella[i, j] + ai_quinella[j, i]
                 q_ev = q_prob * q_odds if q_odds > 0 else 0
                 
-                # 🌟 オッズが取れていなくても確率は100%リストへ格納
-                all_pair_stats.append({
-                    '券種': '馬連', 
-                    '馬番': pair_key, 
-                    '組み合わせ': pair_name, 
-                    '確率': q_prob, 
-                    'オッズ': q_odds if q_odds > 0 else '---', 
-                    '期待値(EV)': q_ev if q_odds > 0 else 0
-                })
+                all_pair_stats.append({'券種': '馬連', '馬番': pair_key, '組み合わせ': pair_name, '確率': q_prob, 'オッズ': q_odds if q_odds > 0 else '---', '期待値(EV)': q_ev if q_odds > 0 else 0})
                 
                 if q_odds > 0 and q_ev >= 1.15:
                     b_val = q_odds - 1.0
@@ -322,20 +370,11 @@ if st.sidebar.button("🔱 予想・ケリー計算を実行"):
                     if k_amt > 0:
                         pair_bets.append({'券種': '馬連', '馬番': pair_key, '組み合わせ': pair_name, '確率': q_prob, 'オッズ': q_odds, '期待値(EV)': q_ev, '推奨金額(円)': k_amt})
                 
-                # ワイド
                 w_odds = r_wide.get(pair_key, 0)
                 w_prob = ai_wide[i, j]
                 w_ev = w_prob * w_odds if w_odds > 0 else 0
                 
-                # 🌟 オッズが取れていなくても確率は100%リストへ格納
-                all_pair_stats.append({
-                    '券種': 'ワイド', 
-                    '馬番': pair_key, 
-                    '組み合わせ': pair_name, 
-                    '確率': w_prob, 
-                    'オッズ': w_odds if w_odds > 0 else '---', 
-                    '期待値(EV)': w_ev if w_odds > 0 else 0
-                })
+                all_pair_stats.append({'券種': 'ワイド', '馬番': pair_key, '組み合わせ': pair_name, '確率': w_prob, 'オッズ': w_odds if w_odds > 0 else '---', '期待値(EV)': w_ev if w_odds > 0 else 0})
                 
                 if w_odds > 0 and w_ev >= 1.15:
                     b_val = w_odds - 1.0
@@ -346,12 +385,12 @@ if st.sidebar.button("🔱 予想・ケリー計算を実行"):
                         pair_bets.append({'券種': 'ワイド', '馬番': pair_key, '組み合わせ': pair_name, '確率': w_prob, 'オッズ': w_odds, '期待値(EV)': w_ev, '推奨金額(円)': k_amt})
                             
         df_pairs = pd.DataFrame(pair_bets)
-        df_all_pairs = pd.DataFrame(all_pair_stats) # 全一覧用
+        df_all_pairs = pd.DataFrame(all_pair_stats)
 
         # ----------------------------------------------------
         # 画面表示
         # ----------------------------------------------------
-        st.write(f"### 🏁 【{venue} {race_num_str}R】 🏆 複勝 期待値＆ケリー推奨")
+        st.write(f"### 🏁 【{v_name} {race_num_str}R】 🏆 複勝 期待値＆ケリー推奨")
         
         df_race['AI複勝率'] = (df_race['AI複勝率_num'] * 100).map('{:.1f}%'.format)
         model_cols = ['徳川家康予測', '前田利家予測', '上杉景勝予測', '毛利輝元予測', '宇喜多秀家予測']
@@ -366,29 +405,22 @@ if st.sidebar.button("🔱 予想・ケリー計算を実行"):
         
         st.write("---")
         
-        # 激アツ推奨買い目（今まで通り、EV1.15以上のみ）
         if not df_pairs.empty:
-            st.write(f"### 🔗 【{venue} {race_num_str}R】 馬連・ワイド 激アツ推奨買い目")
+            st.write(f"### 🔗 【{v_name} {race_num_str}R】 馬連・ワイド 激アツ推奨買い目")
             df_pairs['期待値(EV)'] = df_pairs['期待値(EV)'].map('{:.2f}'.format)
             df_pairs['確率'] = (df_pairs['確率'] * 100).map('{:.1f}%'.format)
-            
             df_pairs = df_pairs.sort_values(by=['券種', '推奨金額(円)', '期待値(EV)'], ascending=[False, False, False])
             st.dataframe(df_pairs, use_container_width=True, hide_index=True)
         else:
-            st.info(f"ℹ️ {venue} {race_num_str}R では、馬連・ワイドで期待値(EV)が1.15を超え、購入対象となる組み合わせはありませんでした。")
+            st.info(f"ℹ️ {v_name} {race_num_str}R では、馬連・ワイドで期待値(EV)が1.15を超え、購入対象となる組み合わせはありませんでした。")
 
-        # 🌟 NEW! すべての組み合わせの期待値をランキングで確認できるボタンを追加
         with st.expander("📊 すべての馬連・ワイドの確率・期待値一覧を見る（オッズ取得失敗時も確率は確認可能）"):
             if not df_all_pairs.empty:
-                # オッズが0または文字列の場合は「---」などの文字に変換
-                df_all_pairs['期待値(EV)'] = df_all_pairs['期待値(EV)'].apply(lambda x: f"{float(x):.2f}" if isinstance(x, (int, float)) and x > 0 else "---")
-                df_all_pairs['オッズ'] = df_all_pairs['オッズ'].apply(lambda x: f"{float(x):.1f}" if isinstance(x, (int, float)) and x > 0 else "---")
-                df_all_pairs['確率_num'] = df_all_pairs['確率'] # ソート用に数値を残す
+                df_all_pairs['期待値(EV)'] = pd.to_numeric(df_all_pairs['期待値(EV)'], errors='coerce').map(lambda x: f"{x:.2f}" if x > 0 else "---")
+                df_all_pairs['オッズ'] = pd.to_numeric(df_all_pairs['オッズ'], errors='coerce').map(lambda x: f"{x:.1f}" if x > 0 else "---")
+                df_all_pairs['確率_num'] = df_all_pairs['確率']
                 df_all_pairs['確率'] = (df_all_pairs['確率'] * 100).map('{:.1f}%'.format)
-                
-                # 確率が高い順にソートして表示
-                df_all_pairs = df_all_pairs.sort_values(by=['券種', '確率_num'], ascending=[False, False])
-                df_all_pairs = df_all_pairs.drop(columns=['確率_num'])
+                df_all_pairs = df_all_pairs.sort_values(by=['券種', '確率_num'], ascending=[False, False]).drop(columns=['確率_num'])
                 st.dataframe(df_all_pairs, use_container_width=True, hide_index=True)
             else:
                 st.warning("一覧データが生成できませんでした。")
