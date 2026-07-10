@@ -48,35 +48,89 @@ def load_mappings_v7():
 models = load_models_v7()
 jockey_map, trainer_map, memory_df = load_mappings_v7()
 
+# --- 超・ガバガバ読み取り機能（手動コピペ用） ---
+def parse_pasted_text(text):
+    horses_data = []
+    lines = text.split('\n')
+    current_umaban = None
+    
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        
+        if re.match(r'^\d+$', line):
+            num = int(line)
+            if 1 <= num <= 18:
+                current_umaban = num
+                continue
+                
+        m_same = re.match(r'^(\d+)\s+([ァ-ンヴー・]{2,9})', line)
+        if m_same:
+            umaban = int(m_same.group(1))
+            name = m_same.group(2)
+            if 1 <= umaban <= 18 and not any(h['馬番'] == umaban for h in horses_data):
+                horses_data.append({'馬番': umaban, '馬名': name, '枠番':0, '単勝オッズ_仮':10.0})
+            current_umaban = None
+            continue
+            
+        m_name = re.search(r'^[ァ-ンヴー・]{2,9}', line)
+        if m_name and current_umaban is not None:
+            name = m_name.group(0)
+            if not any(h['馬番'] == current_umaban for h in horses_data):
+                horses_data.append({'馬番': current_umaban, '馬名': name, '枠番':0, '単勝オッズ_仮':10.0})
+            current_umaban = None
+            continue
+
+    if not horses_data:
+        names = re.findall(r'[ァ-ンヴー・]{2,9}', text)
+        ignore_list = ['ルメール', 'デムーロ', 'モレイラ', 'マーカンド', 'ムルザバ', 'レーン', 'ダート', 'コース']
+        filtered_names = [n for n in names if n not in ignore_list]
+        
+        seen = set()
+        unique_names = []
+        for n in filtered_names:
+            if n not in seen:
+                unique_names.append(n)
+                seen.add(n)
+                
+        for i, name in enumerate(unique_names):
+            if i >= 18: break
+            horses_data.append({'馬番': i+1, '馬名': name, '枠番':0, '単勝オッズ_仮':10.0})
+
+    return pd.DataFrame(horses_data) if horses_data else None
+
+
 # --- 🎯 ネット競馬から「絶対に」間違えずに条件と馬を抜く関数 ---
 def fetch_race_details_and_horses(race_id_str):
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id_str}"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://race.netkeiba.com/'
+        'Referer': 'https://race.netkeiba.com/',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8'
     }
     
     try:
         time.sleep(1.0) # ブロック回避のゆらぎ
-        res = requests.get(url, headers=headers, timeout=10)
+        session = requests.Session()
+        res = session.get(url, headers=headers, timeout=10)
         
-        # 🌟 ここが最重要！古いサイトの文字を強制的に正しい日本語（EUC-JP）に翻訳し、読めないゴミは無視する
+        if res.status_code != 200:
+            return None, f"HTTP Error {res.status_code}", "芝", 1600, "晴", "良"
+        
         html_text = res.content.decode('euc-jp', errors='ignore')
         soup = BeautifulSoup(html_text, 'html.parser')
         
-        # デフォルト値
         course_type = "芝"
         distance = 1600
         weather = "晴"
         ground = "良"
         venue_name = "その他"
         
-        # 🏁 レース条件（芝・ダート・距離・天候・馬場）を厳密に抽出
         race_data01 = soup.select_one('.RaceData01')
         if race_data01:
             text01 = race_data01.text.strip()
             
-            # ダートか芝か障害かを確実に判定
             if 'ダ' in text01 or 'ダート' in text01:
                 course_type = "ダート"
             elif '障' in text01 or '障害' in text01:
@@ -84,22 +138,18 @@ def fetch_race_details_and_horses(race_id_str):
             else:
                 course_type = "芝"
                 
-            # 距離
             m_dist = re.search(r'(\d+)m', text01)
             if m_dist: distance = int(m_dist.group(1))
             
-            # 天候
             if '天候:曇' in text01: weather = "曇"
             elif '天候:雨' in text01: weather = "雨"
             elif '天候:小雨' in text01: weather = "小雨"
             elif '天候:雪' in text01: weather = "雪"
             
-            # 馬場状態
             if '馬場:稍' in text01: ground = "稍重"
             elif '馬場:重' in text01: ground = "重"
             elif '馬場:不' in text01: ground = "不良"
             
-        # 🏟️ 開催場を抽出
         race_data02 = soup.select_one('.RaceData02')
         if race_data02:
             text02 = race_data02.text.strip()
@@ -109,7 +159,6 @@ def fetch_race_details_and_horses(race_id_str):
                     venue_name = v
                     break
                     
-        # 🐴 馬名と馬番の抽出
         horses = []
         for tr in soup.select('.HorseList'):
             umaban_td = tr.select_one('td.Umaban')
@@ -131,21 +180,22 @@ def fetch_real_odds(race_id):
     headers = {'User-Agent': 'Mozilla/5.0'}
     odds_dict = {'win': {}, 'place': {}, 'quinella': {}, 'wide': {}}
     try:
-        res1 = requests.get(base_url.format(race_id, 1), headers=headers, timeout=5)
+        session = requests.Session()
+        res1 = session.get(base_url.format(race_id, 1), headers=headers, timeout=5)
         d1 = res1.json().get('data', {}).get('odds', {})
         if '1' in d1:
             for k, v in d1['1'].items(): odds_dict['win'][int(k)] = float(v[0])
         if '2' in d1:
             for k, v in d1['2'].items(): odds_dict['place'][int(k)] = float(v[0])
             
-        res4 = requests.get(base_url.format(race_id, 4), headers=headers, timeout=5)
+        res4 = session.get(base_url.format(race_id, 4), headers=headers, timeout=5)
         d4 = res4.json().get('data', {}).get('odds', {})
         for k1, v1_dict in d4.items():
             for k2, v2 in v1_dict.items():
                 u1, u2 = sorted([int(k1), int(k2)])
                 odds_dict['quinella'][f"{u1}-{u2}"] = float(v2[0])
                 
-        res5 = requests.get(base_url.format(race_id, 5), headers=headers, timeout=5)
+        res5 = session.get(base_url.format(race_id, 5), headers=headers, timeout=5)
         d5 = res5.json().get('data', {}).get('odds', {})
         for k1, v1_dict in d5.items():
             for k2, v2 in v1_dict.items():
@@ -190,7 +240,7 @@ def calculate_exact_multi_probabilities(win_probs):
 st.sidebar.markdown("### 🎯🚀超・一撃予想モード")
 st.sidebar.markdown("URLを貼るだけで、**出馬表・距離・天候・馬場・開催場**を裏側で自動ハッキングして予想します！")
 
-url_input = st.sidebar.text_input("① レースのURL (または race_id)", "")
+url_input = st.sidebar.text_input("① レースのURL (または 12桁のrace_id)", "")
 budget = st.sidebar.number_input("② 今回の軍資金 (円)", value=10000, step=1000)
 
 auto_predict_btn = st.sidebar.button("🚀 URLから全自動で予想を実行！", type="primary")
@@ -213,8 +263,9 @@ if is_run:
         st.error("モデルファイルが見つかりません。")
         st.stop()
         
-    m = re.search(r'race_id=(\d+)', url_input)
-    race_id = m.group(1) if m else url_input.strip()
+    # URLからrace_id（数字12桁）を強力に抽出する
+    m = re.search(r'(\d{12})', url_input)
+    race_id = m.group(1) if m else re.sub(r'\D', '', url_input) # 数字だけ抜く
     
     race_num_str = "??"
     if race_id and len(race_id) >= 2 and race_id[-2:].isdigit():
@@ -223,22 +274,23 @@ if is_run:
     with st.spinner(f"🏇 レースデータを抽出＆オッズ計算中..."):
         
         if auto_predict_btn:
-            if not race_id:
-                st.error("❌ エラー：URL または race_id が入力されていません！")
+            if not race_id or len(race_id) < 10:
+                st.error("❌ エラー：URL または race_id が正しく入力されていません！（URLが途切れている可能性があります）\n\n💡 12桁の数字（例: 202408030311）だけを入力しても動きます。")
                 st.stop()
             
-            # 🌟 新・完全抽出ロジックの呼び出し
             df_race, venue, course_type, distance, weather, ground = fetch_race_details_and_horses(race_id)
             
             if df_race is None or df_race.empty:
-                st.error("❌ エラー：出馬表の自動取得に失敗しました。URLが間違っているか、アクセスがブロックされました。下の「手動補正モード」を使用してください。")
+                st.error(f"❌ エラー：出馬表の自動取得に失敗しました。\n\n【原因の可能性】\n① URLのコピーミス\n② Streamlitのサーバーがネット競馬からロボットとしてブロック(403エラー)されている\n\n💡 ブロックされた場合は、左下の「手動補正モード」を開き、出馬表をコピペして実行してください。")
                 st.stop()
                 
             st.success(f"✅ 【一撃ハッキング成功】 {venue} {distance}m ({course_type}) / 天候:{weather} / 馬場:{ground} / {len(df_race)}頭立て")
             
         else: # 手動モード
-            # (手動モードのパース処理は省略せず簡易実行)
-            df_race = pd.DataFrame([{'馬番': i+1, '馬名': f"馬{i+1}"} for i in range(11)]) # ダミー回避
+            df_race = parse_pasted_text(pasted_text)
+            if df_race is None or df_race.empty:
+                st.error("❌ 抽出不可能なレベルのテキストです。もう一度出馬表をコピー＆ペーストしてみてください。")
+                st.stop()
             venue = manual_venue
             course_type = manual_course
             distance = manual_dist
@@ -393,7 +445,6 @@ if is_run:
             
         df_final = df_race[['馬番', '馬名', '複勝オッズ_下限', 'AI複勝率', '複勝期待値(EV)', '推奨金額(円)', 'おすすめ度']].copy()
         
-        # オッズ0倍(未発表)の場合はハイフンにする親切設計
         df_final['複勝期待値(EV)'] = df_final.apply(lambda row: '{:.2f}'.format(row['複勝期待値(EV)']) if row['複勝オッズ_下限'] != 0 and row['複勝オッズ_下限'] != 10.0 else "---", axis=1)
         df_final['複勝オッズ_下限'] = df_final['複勝オッズ_下限'].apply(lambda x: x if x != 0 and x != 10.0 else "---")
         
