@@ -214,30 +214,49 @@ def fetch_real_odds(race_id):
     base_url = "https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={}&action=init&type={}"
     headers = {'User-Agent': 'Mozilla/5.0'}
     odds_dict = {'win': {}, 'place': {}, 'quinella': {}, 'wide': {}}
+    
+    # 🌟 NEW: オッズが "***" などの文字列だった場合に安全にスルーする関数
+    def safe_float(val):
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return 0.0
+
+    session = requests.Session()
+    
+    # 単勝・複勝
     try:
-        session = requests.Session()
         res1 = session.get(base_url.format(race_id, 1), headers=headers, timeout=5)
         d1 = res1.json().get('data', {}).get('odds', {})
         if '1' in d1:
-            for k, v in d1['1'].items(): odds_dict['win'][int(k)] = float(v[0])
+            for k, v in d1['1'].items(): odds_dict['win'][int(k)] = safe_float(v[0])
         if '2' in d1:
-            for k, v in d1['2'].items(): odds_dict['place'][int(k)] = float(v[0])
-            
+            for k, v in d1['2'].items(): odds_dict['place'][int(k)] = safe_float(v[0])
+    except Exception:
+        pass
+        
+    # 馬連
+    try:
         res4 = session.get(base_url.format(race_id, 4), headers=headers, timeout=5)
         d4 = res4.json().get('data', {}).get('odds', {})
         for k1, v1_dict in d4.items():
             for k2, v2 in v1_dict.items():
                 u1, u2 = sorted([int(k1), int(k2)])
-                odds_dict['quinella'][f"{u1}-{u2}"] = float(v2[0])
-                
+                odds_dict['quinella'][f"{u1}-{u2}"] = safe_float(v2[0])
+    except Exception:
+        pass
+        
+    # ワイド
+    try:
         res5 = session.get(base_url.format(race_id, 5), headers=headers, timeout=5)
         d5 = res5.json().get('data', {}).get('odds', {})
         for k1, v1_dict in d5.items():
             for k2, v2 in v1_dict.items():
                 u1, u2 = sorted([int(k1), int(k2)])
-                odds_dict['wide'][f"{u1}-{u2}"] = float(v2[0])
+                odds_dict['wide'][f"{u1}-{u2}"] = safe_float(v2[0])
     except Exception:
         pass
+        
     return odds_dict
 
 # --- 🧠 Harvilleモデル（確率計算） ---
@@ -269,7 +288,7 @@ def calculate_exact_multi_probabilities(win_probs):
 st.sidebar.markdown("### 🎯🚀 超・一撃予想モード")
 st.sidebar.caption("URLを貼るだけで、出馬表・距離・天候・馬場・開催場を裏側で自動ハッキングして予想します！")
 
-url_input = st.sidebar.text_input("① レースのURL (または 12桁のrace_id)", "")
+url_input = st.sidebar.text_input("① レースのURL (★手動モード時もオッズ取得に必須！)", "")
 budget = st.sidebar.number_input("② 今回の軍資金 (円)", value=10000, step=1000)
 
 auto_predict_btn = st.sidebar.button("🚀 URLから全自動で予想を実行！", type="primary")
@@ -320,8 +339,13 @@ if is_run:
                 st.error("❌ 抽出エラー：もう一度出馬表をコピー＆ペーストしてください。")
                 st.stop()
             venue, course_type, distance, weather, ground = manual_venue, manual_course, manual_dist, manual_weather, manual_ground
+            
+            if not race_id or len(race_id) < 10:
+                st.warning("⚠️ 画面左上の「① レースのURL」が入力されていないため、最新オッズの取得ができませんでした。\n\nオッズと期待値(EV)は「---」になりますが、AIによる【当たる確率（勝率・複勝率）】の予測ランキングはご覧いただけます。")
+            else:
+                st.info("🛠️ 手動入力データと最新オッズを組み合わせて予想を実行しました。")
 
-        # 🌟 カッコいいダッシュボード表示（st.columns と st.metric を使用）
+        # 🌟 カッコいいダッシュボード表示
         st.markdown(f"### 📍 【{venue} {race_num_str}R】 レース情報")
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("🏇 条件", f"{course_type} {distance}m")
@@ -463,7 +487,6 @@ if is_run:
         df_final['複勝期待値(EV)'] = df_final.apply(lambda row: '{:.2f}'.format(row['複勝期待値(EV)']) if row['複勝オッズ_下限'] != 0 and row['複勝オッズ_下限'] != 10.0 else "---", axis=1)
         df_final['複勝オッズ_下限'] = df_final['複勝オッズ_下限'].apply(lambda x: x if x != 0 and x != 10.0 else "---")
         
-        # Pandasの機能を使って「勝負」「狙い」の文字を装飾して表示
         st.dataframe(df_final.sort_values(by=['推奨金額(円)', 'AI複勝率'], ascending=[False, False]).style.map(style_recommendation, subset=['おすすめ度']), use_container_width=True, hide_index=True)
         
         st.write("---")
