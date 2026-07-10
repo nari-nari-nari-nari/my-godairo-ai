@@ -50,7 +50,7 @@ def load_mappings_v7():
 models = load_models_v7()
 jockey_map, trainer_map, memory_df = load_mappings_v7()
 
-# --- 🤖 [NEW] URLから出馬表とレース条件を全自動スクレイピング ---
+# --- 🤖 URLから出馬表とレース条件を全自動スクレイピング ---
 def fetch_race_details(race_id):
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     headers = {
@@ -65,10 +65,11 @@ def fetch_race_details(race_id):
         time.sleep(random.uniform(0.5, 1.5))
         
         res = requests.get(url, headers=headers, timeout=10)
-        res.encoding = 'EUC-JP'
-        soup = BeautifulSoup(res.text, 'html.parser')
+        # 🌟 【重要修正】文字化け対策：ネット競馬特有のEUC-JPをバイナリから強制的に完全翻訳
+        html_text = res.content.decode('euc-jp', errors='replace')
+        soup = BeautifulSoup(html_text, 'html.parser')
         
-        # 1. 出馬表の抽出（構造が複雑でも確実に拾えるように強化）
+        # 1. 出馬表の抽出
         horses = []
         for tr in soup.select('tr.HorseList'):
             umaban_el = tr.select_one('td[class*="Umaban"]')
@@ -143,12 +144,10 @@ def fetch_real_odds(race_id):
     }
     odds_dict = {'win': {}, 'place': {}, 'quinella': {}, 'wide': {}}
     
-    # Sessionを使ってクッキーを維持し、人間と同じようなアクセスを装う
     session = requests.Session()
     session.headers.update(headers)
     
     try:
-        # ステルス対策：各APIリクエストの間にランダムな待機時間（0.5〜1.2秒）を挟む
         time.sleep(random.uniform(0.5, 1.2))
         res1 = session.get(base_url.format(race_id, 1), timeout=10)
         d1 = res1.json().get('data', {}).get('odds', {})
@@ -208,12 +207,10 @@ st.sidebar.markdown("URLを貼るだけで、**出馬表・距離・天候・馬
 url_input = st.sidebar.text_input("① レースのURL (または race_id)", placeholder="https://race.netkeiba.com/...")
 budget = st.sidebar.number_input("② 今回の軍資金 (円)", value=10000, step=1000)
 
-# 🌟 メインの自動実行ボタン
 auto_predict_btn = st.sidebar.button("🚀 URLから全自動で予想を実行！", type="primary")
 
 st.sidebar.markdown("---")
 
-# 🌟 失敗時用の手動モード（折りたたみ）
 with st.sidebar.expander("🛠️ 手動補正モード（自動取得に失敗した時用）"):
     st.markdown("出馬表を「適当に全部コピー」してペースト")
     pasted_text = st.text_area("出馬表コピペエリア", height=100)
@@ -430,6 +427,7 @@ if auto_predict_btn or manual_predict_btn:
 
         with st.expander("📊 すべての馬連・ワイドの確率・期待値一覧を見る（オッズ取得失敗時も確率は確認可能）"):
             if not df_all_pairs.empty:
+                # 安全にフォーマットするための処理
                 df_all_pairs['期待値(EV)'] = pd.to_numeric(df_all_pairs['期待値(EV)'], errors='coerce').map(lambda x: f"{x:.2f}" if x > 0 else "---")
                 df_all_pairs['オッズ'] = pd.to_numeric(df_all_pairs['オッズ'], errors='coerce').map(lambda x: f"{x:.1f}" if x > 0 else "---")
                 df_all_pairs['確率_num'] = df_all_pairs['確率']
