@@ -215,54 +215,68 @@ def fetch_real_odds(race_id):
     headers = {'User-Agent': 'Mozilla/5.0'}
     odds_dict = {'win': {}, 'place': {}, 'quinella': {}, 'wide': {}}
     
-    # 🌟 NEW: オッズが "***" などの文字列だった場合に安全にスルーする関数
     def safe_float(val):
         try:
             return float(val)
         except (ValueError, TypeError):
             return 0.0
 
-    session = requests.Session()
-    
-    # 単勝・複勝 (type=1) - 以前と同じですが安全に取得
     try:
-        res1 = session.get(base_url.format(race_id, 1), headers=headers, timeout=5)
-        data1 = res1.json().get('data', {}).get('odds', {})
-        if '1' in data1: # 単勝
-            for k, v in data1['1'].items():
-                odds_dict['win'][int(k)] = safe_float(v[0])
-        if '2' in data1: # 複勝
-            for k, v in data1['2'].items():
-                odds_dict['place'][int(k)] = safe_float(v[0])
-    except Exception as e:
-        print(f"Win/Place Odds Error: {e}")
+        session = requests.Session()
         
-    # 馬連 (type=4) - データ構造の変更に対応
-    try:
-        res4 = session.get(base_url.format(race_id, 4), headers=headers, timeout=5)
-        data4 = res4.json().get('data', {}).get('odds', {})
-        for k1, v1_dict in data4.items():
-            if isinstance(v1_dict, dict): # 念のため辞書型か確認
-                for k2, v2 in v1_dict.items():
-                    u1, u2 = sorted([int(k1), int(k2)])
-                    # v2はリストで最初の要素がオッズ
-                    if isinstance(v2, list) and len(v2) > 0:
-                        odds_dict['quinella'][f"{u1}-{u2}"] = safe_float(v2[0])
-    except Exception as e:
-         print(f"Quinella Odds Error: {e}")
-        
-    # ワイド (type=5) - データ構造の変更に対応
-    try:
-        res5 = session.get(base_url.format(race_id, 5), headers=headers, timeout=5)
-        data5 = res5.json().get('data', {}).get('odds', {})
-        for k1, v1_dict in data5.items():
-             if isinstance(v1_dict, dict):
-                for k2, v2 in v1_dict.items():
-                    u1, u2 = sorted([int(k1), int(k2)])
-                    if isinstance(v2, list) and len(v2) > 0:
-                         odds_dict['wide'][f"{u1}-{u2}"] = safe_float(v2[0])
-    except Exception as e:
-        print(f"Wide Odds Error: {e}")
+        # 単勝(1)・複勝(2)
+        try:
+            res1 = session.get(base_url.format(race_id, 1), headers=headers, timeout=5)
+            d1 = res1.json().get('data', {}).get('odds', {})
+            if '1' in d1:
+                for k, v in d1['1'].items(): 
+                    if isinstance(v, list) and len(v) > 0:
+                        odds_dict['win'][int(k)] = safe_float(v[0])
+            if '2' in d1:
+                for k, v in d1['2'].items(): 
+                    if isinstance(v, list) and len(v) > 0:
+                        odds_dict['place'][int(k)] = safe_float(v[0])
+        except Exception:
+            pass
+            
+        # 馬連 (type=4)
+        try:
+            res4 = session.get(base_url.format(race_id, 4), headers=headers, timeout=5)
+            d4 = res4.json().get('data', {}).get('odds', {})
+            # 🌟 データは '4' というキーの中にさらに格納されているため、それを開ける
+            target_d4 = d4.get('4', d4)
+            for k1, v1_dict in target_d4.items():
+                if isinstance(v1_dict, dict):
+                    for k2, v2 in v1_dict.items():
+                        try:
+                            u1, u2 = sorted([int(k1), int(k2)])
+                            if isinstance(v2, list) and len(v2) > 0:
+                                odds_dict['quinella'][f"{u1}-{u2}"] = safe_float(v2[0])
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+            
+        # ワイド (type=5)
+        try:
+            res5 = session.get(base_url.format(race_id, 5), headers=headers, timeout=5)
+            d5 = res5.json().get('data', {}).get('odds', {})
+            # 🌟 データは '5' というキーの中にさらに格納されているため、それを開ける
+            target_d5 = d5.get('5', d5)
+            for k1, v1_dict in target_d5.items():
+                if isinstance(v1_dict, dict):
+                    for k2, v2 in v1_dict.items():
+                        try:
+                            u1, u2 = sorted([int(k1), int(k2)])
+                            if isinstance(v2, list) and len(v2) > 0:
+                                odds_dict['wide'][f"{u1}-{u2}"] = safe_float(v2[0])
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+            
+    except Exception:
+        pass
         
     return odds_dict
 
